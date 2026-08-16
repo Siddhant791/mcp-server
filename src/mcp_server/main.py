@@ -19,7 +19,6 @@ def add_todo(title: str) -> str:
 
 
 if __name__ == "__main__":
-    print('MCP server started')
     import asyncio
 
     asyncio.run(mcp.run_stdio_async())
