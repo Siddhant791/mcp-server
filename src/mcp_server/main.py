@@ -19,6 +19,12 @@ def add_todo(title: str) -> str:
 
 
 if __name__ == "__main__":
-    import asyncio
+    import sys
 
-    asyncio.run(mcp.run_stdio_async())
+    if "--sse" in sys.argv:
+        import uvicorn
+        app = mcp.sse_app()
+        uvicorn.run(app, host="0.0.0.0", port=8000)
+    else:
+        import asyncio
+        asyncio.run(mcp.run_stdio_async())

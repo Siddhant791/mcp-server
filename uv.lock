@@ -335,10 +335,14 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "mcp", extra = ["cli"] },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "mcp", extras = ["cli"], specifier = ">=1.0.0" }]
+requires-dist = [
+    { name = "mcp", extras = ["cli"], specifier = ">=1.0.0" },
+    { name = "uvicorn", specifier = ">=0.30.0" },
+]
 
 [[package]]
 name = "mcp-types"
