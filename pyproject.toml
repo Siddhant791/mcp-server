@@ -13,7 +13,7 @@ dependencies = ["mcp[cli]>=1.0.0", "uvicorn>=0.30.0"]
 mcp-server = "mcp_server:main"
 
 [tool.vercel]
-entrypoint = "api/server.py"
+entrypoint = "api/server:app"
 
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
