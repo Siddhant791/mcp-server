@@ -31,7 +31,7 @@ async def get_todos() -> list[dict]:
 @mcp.tool()
 async def add_todo(title: str) -> str:
     """Add a new todo item to the list in MongoDB."""
-    todo = {"title": title, "completed": False}
+    todo = {"title": title, "completed ": False}
     result = await todos_collection.insert_one(todo)
     return f"Added todo: {title} (id: {result.inserted_id})"
 
