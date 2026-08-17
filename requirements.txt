@@ -1,6 +1,9 @@
 # Direct dependencies
 mcp[cli]>=1.0.0
 uvicorn>=0.30.0
+motor==3.7.1
+pymongo==4.17.0
+dnspython==2.8.0
 
 # Transitive dependencies (from uv.lock)
 annotated-doc==0.0.5
