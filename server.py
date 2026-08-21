@@ -77,4 +77,23 @@ async def add_todo(title: str) -> str:
     return f"Added todo: {title} (id: {result.inserted_id})"
 
 
+@mcp.tool()
+async def toggle_todo(title: str) -> str:
+    """Toggle a todo item's completed status. Use this when the user wants to mark a todo as done/completed/finished, or mark a completed todo as not done/incomplete/pending. Pass the exact title of the todo item to toggle."""
+    if todos_collection is None:
+        return "Error: MongoDB not configured. Set MONGODB_URI environment variable."
+
+    doc = await todos_collection.find_one({"title": title})
+    if not doc:
+        available = await todos_collection.distinct("title")
+        if available:
+            return f"Todo '{title}' not found. Available todos: {', '.join(available)}"
+        return f"Todo '{title}' not found. The todo list is empty."
+
+    new_status = not doc.get("completed", False)
+    await todos_collection.update_one({"_id": doc["_id"]}, {"$set": {"completed": new_status}})
+    status_text = "completed" if new_status else "incomplete"
+    return f"Todo '{title}' marked as {status_text}."
+
+
 app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
