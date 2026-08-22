@@ -157,6 +157,7 @@ async def _well_known(request: Request) -> JSONResponse:
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
         "scopes_supported": ["openid", "email", "profile"],
+        "code_challenge_methods_supported": ["S256"],
     })
 
 
@@ -172,6 +173,7 @@ async def _openid_configuration(request: Request) -> JSONResponse:
         "id_token_signing_alg_values_supported": ["RS256"],
         "scopes_supported": ["openid", "email", "profile"],
         "token_endpoint_auth_methods_supported": ["none"],
+        "code_challenge_methods_supported": ["S256"],
     })
 
 
@@ -184,11 +186,15 @@ async def _protected_resource(request: Request) -> JSONResponse:
 
 async def _authorize(request: Request) -> RedirectResponse:
     chatgpt_redirect = request.query_params.get("redirect_uri", "")
+    code_challenge = request.query_params.get("code_challenge", "")
+    code_challenge_method = request.query_params.get("code_challenge_method", "S256")
     google_state = secrets.token_urlsafe(32)
     if db is not None:
         await db["_oauth_states"].insert_one({
             "state": google_state,
             "chatgpt_redirect_uri": chatgpt_redirect,
+            "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
             "created_at": datetime.now(timezone.utc),
         })
     server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
@@ -285,10 +291,12 @@ async def _callback(request: Request):
     jwt_token = create_jwt(user_id, email, name, role, master_user_id)
 
     server_code = secrets.token_urlsafe(32)
+    code_challenge = stored_state.get("code_challenge", "")
     if db is not None:
         await db["_oauth_codes"].insert_one({
             "code": server_code,
             "jwt_token": jwt_token,
+            "code_challenge": code_challenge,
             "created_at": datetime.now(timezone.utc),
         })
 
@@ -330,7 +338,7 @@ async def _register(request: Request) -> JSONResponse:
 
 
 async def _token(request: Request) -> JSONResponse:
-    from starlette.responses import HTMLResponse as _HTML
+    import hashlib, base64
     body = await request.json()
     grant_type = body.get("grant_type")
 
@@ -338,11 +346,19 @@ async def _token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
     code = body.get("code", "")
+    code_verifier = body.get("code_verifier", "")
     auth_info = None
     if db is not None:
         auth_info = await db["_oauth_codes"].find_one_and_delete({"code": code})
 
     if auth_info:
+        stored_challenge = auth_info.get("code_challenge", "")
+        if stored_challenge and code_verifier:
+            computed = base64.urlsafe_b64encode(
+                hashlib.sha256(code_verifier.encode()).digest()
+            ).rstrip(b"=").decode()
+            if computed != stored_challenge:
+                return JSONResponse({"error": "invalid_grant", "detail": "PKCE verification failed"}, status_code=400)
         return JSONResponse({
             "access_token": auth_info["jwt_token"],
             "token_type": "bearer",
