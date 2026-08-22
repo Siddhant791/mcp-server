@@ -143,8 +143,6 @@ async def _get_schema(collection: str, ctx: AuthContext) -> dict | None:
 # ---------------------------------------------------------------------------
 # OAuth / auth endpoints  (Starlette routes, mounted alongside MCP app)
 # ---------------------------------------------------------------------------
-_server_auth_codes: dict[str, dict] = {}  # code → {jwt_token, created}
-_google_states: dict[str, dict] = {}     # google_state → {chatgpt_redirect_uri, created}
 _registered_clients: dict[str, dict] = {}  # client_id → {client_name, client_secret, ...}
 
 
@@ -172,10 +170,12 @@ async def _protected_resource(request: Request) -> JSONResponse:
 async def _authorize(request: Request) -> RedirectResponse:
     chatgpt_redirect = request.query_params.get("redirect_uri", "")
     google_state = secrets.token_urlsafe(32)
-    _google_states[google_state] = {
-        "chatgpt_redirect_uri": chatgpt_redirect,
-        "created": datetime.now(timezone.utc).isoformat(),
-    }
+    if db is not None:
+        await db["_oauth_states"].insert_one({
+            "state": google_state,
+            "chatgpt_redirect_uri": chatgpt_redirect,
+            "created_at": datetime.now(timezone.utc),
+        })
     server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
     url = get_google_auth_url(google_state, redirect_uri=server_callback)
     return RedirectResponse(url)
@@ -238,7 +238,9 @@ async def _callback(request: Request):
     if not code or not google_state:
         return HTMLResponse("<html><body>Missing code or state</body></html>", status_code=400)
 
-    stored_state = _google_states.pop(google_state, None)
+    stored_state = None
+    if db is not None:
+        stored_state = await db["_oauth_states"].find_one_and_delete({"state": google_state})
     if not stored_state:
         return HTMLResponse("<html><body>Invalid or expired state</body></html>", status_code=400)
 
@@ -264,10 +266,12 @@ async def _callback(request: Request):
     jwt_token = create_jwt(user_id, email, name, role, master_user_id)
 
     server_code = secrets.token_urlsafe(32)
-    _server_auth_codes[server_code] = {
-        "jwt_token": jwt_token,
-        "created": datetime.now(timezone.utc).isoformat(),
-    }
+    if db is not None:
+        await db["_oauth_codes"].insert_one({
+            "code": server_code,
+            "jwt_token": jwt_token,
+            "created_at": datetime.now(timezone.utc),
+        })
 
     if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
@@ -310,7 +314,9 @@ async def _token(request: Request) -> JSONResponse:
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
     code = body.get("code", "")
-    auth_info = _server_auth_codes.pop(code, None)
+    auth_info = None
+    if db is not None:
+        auth_info = await db["_oauth_codes"].find_one_and_delete({"code": code})
 
     if auth_info:
         return JSONResponse({
