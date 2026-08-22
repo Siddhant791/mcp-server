@@ -15,10 +15,12 @@ from mcp.server.mcpserver.server import MCPServer
 from auth.middleware import AuthMiddleware, get_current_user, require_auth, require_master
 from auth.models import AuthContext, FamilyMember, generate_user_id
 from auth.oauth import (
+    GOOGLE_REDIRECT_URI,
     create_jwt,
     exchange_code_for_token,
     get_google_auth_url,
     get_user_info_from_google,
+    verify_token,
 )
 
 # ---------------------------------------------------------------------------
@@ -82,9 +84,7 @@ DEFAULT_SCHEMAS = {
 async def _get_auth_ctx() -> AuthContext:
     ctx = get_current_user()
     if ctx is None:
-        raise PermissionError(
-            "Authentication required. Please authenticate via OAuth first."
-        )
+        raise PermissionError("Authentication required. Please authenticate via OAuth first.")
     return ctx
 
 
@@ -144,6 +144,7 @@ async def _get_schema(collection: str, ctx: AuthContext) -> dict | None:
 # OAuth / auth endpoints  (Starlette routes, mounted alongside MCP app)
 # ---------------------------------------------------------------------------
 _authorization_codes: dict[str, dict] = {}  # state → {email, name, user_id, role, master_user_id}
+_registered_clients: dict[str, dict] = {}  # client_id → {client_name, client_secret, ...}
 
 
 async def _well_known(request: Request) -> JSONResponse:
@@ -152,9 +153,12 @@ async def _well_known(request: Request) -> JSONResponse:
         "issuer": base,
         "authorization_endpoint": f"{base}/authorize",
         "token_endpoint": f"{base}/token",
+        "registration_endpoint": f"{base}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "scopes_supported": ["openid", "email", "profile"],
+        "code_challenge_methods_supported": ["S256"],
     })
 
 
@@ -167,8 +171,12 @@ async def _protected_resource(request: Request) -> JSONResponse:
 
 async def _authorize(request: Request) -> RedirectResponse:
     state = secrets.token_urlsafe(32)
-    _authorization_codes[state] = {"created": datetime.now(timezone.utc).isoformat()}
-    url = get_google_auth_url(state)
+    redirect_uri = request.query_params.get("redirect_uri", GOOGLE_REDIRECT_URI)
+    _authorization_codes[state] = {
+        "created": datetime.now(timezone.utc).isoformat(),
+        "redirect_uri": redirect_uri,
+    }
+    url = get_google_auth_url(state, redirect_uri=redirect_uri)
     return RedirectResponse(url)
 
 
@@ -178,8 +186,12 @@ async def _callback(request: Request) -> JSONResponse:
     if not code or not state:
         return JSONResponse({"error": "Missing code or state"}, status_code=400)
 
+    stored = _authorization_codes.pop(state, None)
+    if not stored:
+        return JSONResponse({"error": "Invalid or expired state"}, status_code=400)
+
     try:
-        token_data = await exchange_code_for_token(code)
+        token_data = await exchange_code_for_token(code, redirect_uri=stored.get("redirect_uri", ""))
         access_token = token_data["access_token"]
         user_info = await get_user_info_from_google(access_token)
     except Exception as e:
@@ -205,7 +217,6 @@ async def _callback(request: Request) -> JSONResponse:
             {"$set": {"last_login": datetime.now(timezone.utc)}},
         )
     else:
-        # Check if this email is in any master's family list
         master_doc = await users.find_one(
             {"role": "master", "family_emails": email}
         )
@@ -223,7 +234,6 @@ async def _callback(request: Request) -> JSONResponse:
                 "last_login": datetime.now(timezone.utc),
             })
         else:
-            # New user → becomes master
             user_id = generate_user_id()
             role = "master"
             master_user_id = user_id
@@ -238,18 +248,23 @@ async def _callback(request: Request) -> JSONResponse:
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             })
-            # Create default prefixed collections
             for suffix in DEFAULT_SCHEMAS:
                 coll_name = _prefixed(suffix, AuthContext(user_id, email, name, role, master_user_id))
                 coll = db[coll_name]
                 await coll.insert_one({"_init": True})
                 await coll.delete_one({"_init": True})
-            # Create schemas collection
             schemas_coll = db[f"{user_id}__collection_schemas"]
             for suffix, fields in DEFAULT_SCHEMAS.items():
                 await schemas_coll.insert_one({"name": suffix, "fields": fields})
 
     jwt_token = create_jwt(user_id, email, name, role, master_user_id)
+
+    redirect_uri = stored.get("redirect_uri", "")
+    if redirect_uri:
+        from urllib.parse import urlencode as _urlencode
+        sep = "&" if "?" in redirect_uri else "?"
+        return RedirectResponse(f"{redirect_uri}{sep}{_urlencode({'access_token': jwt_token, 'token_type': 'bearer'})}")
+
     return JSONResponse({
         "access_token": jwt_token,
         "token_type": "bearer",
@@ -262,16 +277,121 @@ async def _callback(request: Request) -> JSONResponse:
     })
 
 
+async def _register(request: Request) -> JSONResponse:
+    body = await request.json()
+    client_name = body.get("client_name", "mcp-client")
+    client_id = "mcp_client_" + secrets.token_hex(8)
+    client_secret = secrets.token_hex(24)
+    _registered_clients[client_id] = {
+        "client_name": client_name,
+        "client_secret": client_secret,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return JSONResponse({
+        "client_id": client_id,
+        "client_name": client_name,
+        "client_secret": client_secret,
+        "redirect_uris": body.get("redirect_uris", []),
+        "grant_types": ["authorization_code"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    })
+
+
 async def _token(request: Request) -> JSONResponse:
     body = await request.json()
     grant_type = body.get("grant_type")
-    if grant_type != "authorization_code":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-    code = body.get("code")
-    if not code or code not in _authorization_codes:
-        return JSONResponse({"error": "invalid_grant"}, status_code=400)
-    info = _authorization_codes.pop(code)
-    return JSONResponse(info)
+
+    if grant_type == "authorization_code":
+        code = body.get("code")
+        client_id = body.get("client_id", "")
+        client_secret = body.get("client_secret", "")
+
+        if client_id and client_id in _registered_clients:
+            expected_secret = _registered_clients[client_id].get("client_secret", "")
+            if client_secret and client_secret != expected_secret:
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+        try:
+            redirect_uri = body.get("redirect_uri", GOOGLE_REDIRECT_URI)
+            token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=redirect_uri)
+            access_token = token_data.get("access_token")
+            id_token = token_data.get("id_token")
+
+            if id_token:
+                google_payload = verify_token(id_token)
+                if google_payload:
+                    email = google_payload.get("email", "")
+                    name = google_payload.get("name", email)
+                else:
+                    user_info = await get_user_info_from_google(access_token)
+                    email = user_info.get("email", "")
+                    name = user_info.get("name", email)
+            else:
+                user_info = await get_user_info_from_google(access_token)
+                email = user_info.get("email", "")
+                name = user_info.get("name", email)
+
+            if not email:
+                return JSONResponse({"error": "Could not determine email"}, status_code=400)
+
+            if db is None:
+                return JSONResponse({"error": "MongoDB not configured"}, status_code=500)
+
+            users = users_collection
+            existing = await users.find_one({"email": email})
+
+            if existing:
+                user_id = existing["user_id"]
+                role = existing["role"]
+                master_user_id = existing.get("master_user_id", user_id)
+                await users.update_one(
+                    {"_id": existing["_id"]},
+                    {"$set": {"last_login": datetime.now(timezone.utc)}},
+                )
+            else:
+                master_doc = await users.find_one({"role": "master", "family_emails": email})
+                if master_doc:
+                    user_id = generate_user_id()
+                    role = "family"
+                    master_user_id = master_doc["user_id"]
+                    await users.insert_one({
+                        "email": email, "name": name, "role": "family",
+                        "user_id": user_id, "master_user_id": master_user_id,
+                        "created_at": datetime.now(timezone.utc),
+                        "last_login": datetime.now(timezone.utc),
+                    })
+                else:
+                    user_id = generate_user_id()
+                    role = "master"
+                    master_user_id = user_id
+                    await users.insert_one({
+                        "email": email, "name": name, "role": "master",
+                        "user_id": user_id, "master_user_id": user_id,
+                        "family_emails": [], "family_members": [],
+                        "created_at": datetime.now(timezone.utc),
+                        "last_login": datetime.now(timezone.utc),
+                    })
+                    for suffix in DEFAULT_SCHEMAS:
+                        coll_name = _prefixed(suffix, AuthContext(user_id, email, name, role, master_user_id))
+                        coll = db[coll_name]
+                        await coll.insert_one({"_init": True})
+                        await coll.delete_one({"_init": True})
+                    schemas_coll = db[f"{user_id}__collection_schemas"]
+                    for suffix, fields in DEFAULT_SCHEMAS.items():
+                        await schemas_coll.insert_one({"name": suffix, "fields": fields})
+
+            jwt_token = create_jwt(user_id, email, name, role, master_user_id)
+            return JSONResponse({
+                "access_token": jwt_token,
+                "token_type": "bearer",
+                "expires_in": 86400,
+            })
+
+        except Exception as e:
+            return JSONResponse({"error": f"Token exchange failed: {e}"}, status_code=400)
+
+    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +546,11 @@ async def _check_family_perm(ctx: AuthContext, perm: str) -> str | None:
     """Returns error message if permission denied, else None."""
     if ctx.role == "master":
         return None
+    if ctx.user_id == "guest":
+        return f"Permission denied: {perm} requires authentication."
     master_doc = await users_collection.find_one({"user_id": ctx.master_user_id})
+    if not master_doc:
+        return f"Permission denied: {perm} requires authentication."
     member = next((m for m in master_doc.get("family_members", []) if m["email"] == ctx.email), None)
     if member and not member.get("permissions", {}).get(perm, True):
         return f"Permission denied: {perm} is disabled for your account."
@@ -768,6 +892,7 @@ mcp_app.routes.insert(1, Route("/.well-known/oauth-protected-resource", _protect
 mcp_app.routes.insert(2, Route("/authorize", _authorize, methods=["GET"]))
 mcp_app.routes.insert(3, Route("/auth/callback", _callback, methods=["GET"]))
 mcp_app.routes.insert(4, Route("/token", _token, methods=["POST"]))
+mcp_app.routes.insert(5, Route("/register", _register, methods=["POST"]))
 
 # Wrap with auth middleware
 app = AuthMiddleware(mcp_app)
