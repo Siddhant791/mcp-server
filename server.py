@@ -51,6 +51,8 @@ if MONGODB_URI:
     db = client[DATABASE_NAME]
     todos_collection = db[COLLECTION_NAME]
 
+VALID_GUEST_COLLECTIONS = {"engagement": "Guest_list_engagement", "marriage": "Guest_list_marriage"}
+
 mcp = MCPServer(name="todo-server")
 
 
@@ -94,6 +96,84 @@ async def toggle_todo(title: str) -> str:
     await todos_collection.update_one({"_id": doc["_id"]}, {"$set": {"completed": new_status}})
     status_text = "completed" if new_status else "incomplete"
     return f"Todo '{title}' marked as {status_text}."
+
+
+@mcp.tool()
+async def get_guests(collection: str) -> list[dict]:
+    """Get the guest list for a wedding event. Pass 'engagement' for engagement guests or 'marriage' for marriage guests. By default only non-deleted (active) guests are returned."""
+    if todos_collection is None:
+        return [{"error": "MongoDB not configured. Set MONGODB_URI environment variable."}]
+    coll_name = VALID_GUEST_COLLECTIONS.get(collection)
+    if not coll_name:
+        return [{"error": f"Invalid collection '{collection}'. Use 'engagement' or 'marriage'."}]
+    coll = db[coll_name]
+    cursor = coll.find({"deleted": {"$ne": True}})
+    guests = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        guests.append(doc)
+    return guests
+
+
+@mcp.tool()
+async def add_guest(collection: str, name: str) -> str:
+    """Add a new guest to the list. Pass 'engagement' for engagement guests or 'marriage' for marriage guests. The guest is added with isInvited set to false by default."""
+    if todos_collection is None:
+        return "Error: MongoDB not configured. Set MONGODB_URI environment variable."
+    coll_name = VALID_GUEST_COLLECTIONS.get(collection)
+    if not coll_name:
+        return f"Invalid collection '{collection}'. Use 'engagement' or 'marriage'."
+    coll = db[coll_name]
+    existing = await coll.find_one({"name": name, "deleted": {"$ne": True}})
+    if existing:
+        return f"Guest '{name}' already exists in {collection} list."
+    deleted_doc = await coll.find_one({"name": name, "deleted": True})
+    if deleted_doc:
+        await coll.update_one({"_id": deleted_doc["_id"]}, {"$set": {"deleted": False, "isInvited": False}})
+        return f"Guest '{name}' restored in {collection} list (was previously removed)."
+    guest = {"name": name, "isInvited": False, "deleted": False}
+    result = await coll.insert_one(guest)
+    return f"Added guest '{name}' to {collection} list (id: {result.inserted_id})."
+
+
+@mcp.tool()
+async def remove_guest(collection: str, name: str) -> str:
+    """Soft delete a guest from the list. Pass 'engagement' for engagement guests or 'marriage' for marriage guests. The guest is not permanently removed but will not appear in default guest list queries."""
+    if todos_collection is None:
+        return "Error: MongoDB not configured. Set MONGODB_URI environment variable."
+    coll_name = VALID_GUEST_COLLECTIONS.get(collection)
+    if not coll_name:
+        return f"Invalid collection '{collection}'. Use 'engagement' or 'marriage'."
+    coll = db[coll_name]
+    doc = await coll.find_one({"name": name, "deleted": {"$ne": True}})
+    if not doc:
+        active = await coll.distinct("name", {"deleted": {"$ne": True}})
+        if active:
+            return f"Guest '{name}' not found in {collection} list. Available guests: {', '.join(active)}"
+        return f"Guest '{name}' not found. The {collection} guest list is empty."
+    await coll.update_one({"_id": doc["_id"]}, {"$set": {"deleted": True}})
+    return f"Guest '{name}' removed from {collection} list."
+
+
+@mcp.tool()
+async def toggle_invited(collection: str, name: str) -> str:
+    """Toggle a guest's invited status. Pass 'engagement' for engagement guests or 'marriage' for marriage guests. Use this when the user wants to mark a guest as invited/not invited."""
+    if todos_collection is None:
+        return "Error: MongoDB not configured. Set MONGODB_URI environment variable."
+    coll_name = VALID_GUEST_COLLECTIONS.get(collection)
+    if not coll_name:
+        return f"Invalid collection '{collection}'. Use 'engagement' or 'marriage'."
+    coll = db[coll_name]
+    doc = await coll.find_one({"name": name, "deleted": {"$ne": True}})
+    if not doc:
+        active = await coll.distinct("name", {"deleted": {"$ne": True}})
+        if active:
+            return f"Guest '{name}' not found in {collection} list. Available guests: {', '.join(active)}"
+        return f"Guest '{name}' not found. The {collection} guest list is empty."
+    new_status = not doc.get("isInvited", False)
+    await coll.update_one({"_id": doc["_id"]}, {"$set": {"isInvited": new_status}})
+    status_text = "invited" if new_status else "not invited"
+    return f"Guest '{name}' marked as {status_text} in {collection} list."
 
 
 app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
