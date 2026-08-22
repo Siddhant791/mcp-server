@@ -143,7 +143,8 @@ async def _get_schema(collection: str, ctx: AuthContext) -> dict | None:
 # ---------------------------------------------------------------------------
 # OAuth / auth endpoints  (Starlette routes, mounted alongside MCP app)
 # ---------------------------------------------------------------------------
-_authorization_codes: dict[str, dict] = {}  # state → {email, name, user_id, role, master_user_id}
+_server_auth_codes: dict[str, dict] = {}  # code → {jwt_token, created}
+_google_states: dict[str, dict] = {}     # google_state → {chatgpt_redirect_uri, created}
 _registered_clients: dict[str, dict] = {}  # client_id → {client_name, client_secret, ...}
 
 
@@ -158,7 +159,6 @@ async def _well_known(request: Request) -> JSONResponse:
         "grant_types_supported": ["authorization_code"],
         "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
         "scopes_supported": ["openid", "email", "profile"],
-        "code_challenge_methods_supported": ["S256"],
     })
 
 
@@ -170,27 +170,79 @@ async def _protected_resource(request: Request) -> JSONResponse:
 
 
 async def _authorize(request: Request) -> RedirectResponse:
-    state = secrets.token_urlsafe(32)
-    redirect_uri = request.query_params.get("redirect_uri", "")
-    _authorization_codes[state] = {
+    chatgpt_redirect = request.query_params.get("redirect_uri", "")
+    google_state = secrets.token_urlsafe(32)
+    _google_states[google_state] = {
+        "chatgpt_redirect_uri": chatgpt_redirect,
         "created": datetime.now(timezone.utc).isoformat(),
-        "chatgpt_redirect_uri": redirect_uri,
     }
     server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
-    url = get_google_auth_url(state, redirect_uri=server_callback)
+    url = get_google_auth_url(google_state, redirect_uri=server_callback)
     return RedirectResponse(url)
+
+
+async def _register_user(email: str, name: str) -> tuple[str, str, str]:
+    users = users_collection
+    existing = await users.find_one({"email": email})
+
+    if existing:
+        user_id = existing["user_id"]
+        role = existing["role"]
+        master_user_id = existing.get("master_user_id", user_id)
+        await users.update_one(
+            {"_id": existing["_id"]},
+            {"$set": {"last_login": datetime.now(timezone.utc)}},
+        )
+        return user_id, role, master_user_id
+
+    master_doc = await users.find_one({"role": "master", "family_emails": email})
+    if master_doc:
+        user_id = generate_user_id()
+        role = "family"
+        master_user_id = master_doc["user_id"]
+        await users.insert_one({
+            "email": email, "name": name, "role": "family",
+            "user_id": user_id, "master_user_id": master_user_id,
+            "created_at": datetime.now(timezone.utc),
+            "last_login": datetime.now(timezone.utc),
+        })
+        return user_id, role, master_user_id
+
+    user_id = generate_user_id()
+    role = "master"
+    master_user_id = user_id
+    await users.insert_one({
+        "email": email, "name": name, "role": "master",
+        "user_id": user_id, "master_user_id": user_id,
+        "family_emails": [], "family_members": [],
+        "created_at": datetime.now(timezone.utc),
+        "last_login": datetime.now(timezone.utc),
+    })
+    for suffix in DEFAULT_SCHEMAS:
+        coll_name = _prefixed(suffix, AuthContext(user_id, email, name, role, master_user_id))
+        coll = db[coll_name]
+        await coll.insert_one({"_init": True})
+        await coll.delete_one({"_init": True})
+    schemas_coll = db[f"{user_id}__collection_schemas"]
+    for suffix, fields in DEFAULT_SCHEMAS.items():
+        await schemas_coll.insert_one({"name": suffix, "fields": fields})
+    return user_id, role, master_user_id
 
 
 async def _callback(request: Request):
     from starlette.responses import HTMLResponse
+
     code = request.query_params.get("code")
-    state = request.query_params.get("state")
-    if not code or not state:
+    google_state = request.query_params.get("state")
+
+    if not code or not google_state:
         return HTMLResponse("<html><body>Missing code or state</body></html>", status_code=400)
 
-    stored = _authorization_codes.pop(state, None)
-    if not stored:
+    stored_state = _google_states.pop(google_state, None)
+    if not stored_state:
         return HTMLResponse("<html><body>Invalid or expired state</body></html>", status_code=400)
+
+    chatgpt_redirect = stored_state.get("chatgpt_redirect_uri", "")
 
     try:
         server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
@@ -208,78 +260,23 @@ async def _callback(request: Request):
     if db is None:
         return HTMLResponse("<html><body>MongoDB not configured</body></html>", status_code=500)
 
-    users = users_collection
-    existing = await users.find_one({"email": email})
-
-    if existing:
-        user_id = existing["user_id"]
-        role = existing["role"]
-        master_user_id = existing.get("master_user_id", user_id)
-        await users.update_one(
-            {"_id": existing["_id"]},
-            {"$set": {"last_login": datetime.now(timezone.utc)}},
-        )
-    else:
-        master_doc = await users.find_one(
-            {"role": "master", "family_emails": email}
-        )
-        if master_doc:
-            user_id = generate_user_id()
-            role = "family"
-            master_user_id = master_doc["user_id"]
-            await users.insert_one({
-                "email": email, "name": name, "role": "family",
-                "user_id": user_id, "master_user_id": master_user_id,
-                "created_at": datetime.now(timezone.utc),
-                "last_login": datetime.now(timezone.utc),
-            })
-        else:
-            user_id = generate_user_id()
-            role = "master"
-            master_user_id = user_id
-            await users.insert_one({
-                "email": email, "name": name, "role": "master",
-                "user_id": user_id, "master_user_id": user_id,
-                "family_emails": [], "family_members": [],
-                "created_at": datetime.now(timezone.utc),
-                "last_login": datetime.now(timezone.utc),
-            })
-            for suffix in DEFAULT_SCHEMAS:
-                coll_name = _prefixed(suffix, AuthContext(user_id, email, name, role, master_user_id))
-                coll = db[coll_name]
-                await coll.insert_one({"_init": True})
-                await coll.delete_one({"_init": True})
-            schemas_coll = db[f"{user_id}__collection_schemas"]
-            for suffix, fields in DEFAULT_SCHEMAS.items():
-                await schemas_coll.insert_one({"name": suffix, "fields": fields})
-
+    user_id, role, master_user_id = await _register_user(email, name)
     jwt_token = create_jwt(user_id, email, name, role, master_user_id)
 
-    import html as _html
-    safe_token = _html.escape(jwt_token)
+    server_code = secrets.token_urlsafe(32)
+    _server_auth_codes[server_code] = {
+        "jwt_token": jwt_token,
+        "created": datetime.now(timezone.utc).isoformat(),
+    }
 
-    chatgpt_redirect = stored.get("chatgpt_redirect_uri", "")
     if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
         sep = "&" if "?" in chatgpt_redirect else "?"
-        return RedirectResponse(f"{chatgpt_redirect}{sep}{_urlencode({'access_token': jwt_token, 'token_type': 'bearer'})}")
+        return RedirectResponse(f"{chatgpt_redirect}{sep}{_urlencode({'code': server_code, 'state': google_state})}")
 
-    return HTMLResponse(f"""<!DOCTYPE html>
+    return HTMLResponse("""<!DOCTYPE html>
 <html><head><title>Auth Complete</title></head>
-<body>
-<script>
-(function() {{
-  var token = "{safe_token}";
-  if (window.opener) {{
-    window.opener.postMessage({{type: "oauth_token", access_token: token, token_type: "bearer"}}, "*");
-    window.close();
-  }} else {{
-    document.body.innerHTML = "<p>Authentication successful. You can close this window.</p>";
-  }}
-}})();
-</script>
-<p>Authenticating...</p>
-</body></html>""")
+<body><p>Authentication successful. You can close this window.</p></body></html>""")
 
 
 async def _register(request: Request) -> JSONResponse:
@@ -290,6 +287,7 @@ async def _register(request: Request) -> JSONResponse:
     _registered_clients[client_id] = {
         "client_name": client_name,
         "client_secret": client_secret,
+        "redirect_uris": body.get("redirect_uris", []),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     return JSONResponse({
@@ -304,99 +302,68 @@ async def _register(request: Request) -> JSONResponse:
 
 
 async def _token(request: Request) -> JSONResponse:
+    from starlette.responses import HTMLResponse as _HTML
     body = await request.json()
     grant_type = body.get("grant_type")
 
-    if grant_type == "authorization_code":
-        code = body.get("code")
-        client_id = body.get("client_id", "")
-        client_secret = body.get("client_secret", "")
+    if grant_type != "authorization_code":
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-        if client_id and client_id in _registered_clients:
-            expected_secret = _registered_clients[client_id].get("client_secret", "")
-            if client_secret and client_secret != expected_secret:
-                return JSONResponse({"error": "invalid_client"}, status_code=401)
+    code = body.get("code", "")
+    auth_info = _server_auth_codes.pop(code, None)
 
-        try:
-            server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
-            token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=server_callback)
-            access_token = token_data.get("access_token")
-            id_token = token_data.get("id_token")
+    if auth_info:
+        return JSONResponse({
+            "access_token": auth_info["jwt_token"],
+            "token_type": "bearer",
+            "expires_in": 86400,
+        })
 
-            if id_token:
-                google_payload = verify_token(id_token)
-                if google_payload:
-                    email = google_payload.get("email", "")
-                    name = google_payload.get("name", email)
-                else:
-                    user_info = await get_user_info_from_google(access_token)
-                    email = user_info.get("email", "")
-                    name = user_info.get("name", email)
+    client_id = body.get("client_id", "")
+    client_secret = body.get("client_secret", "")
+
+    if client_id and client_id in _registered_clients:
+        expected_secret = _registered_clients[client_id].get("client_secret", "")
+        if client_secret and client_secret != expected_secret:
+            return JSONResponse({"error": "invalid_client"}, status_code=401)
+
+    try:
+        server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
+        token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=server_callback)
+        access_token = token_data.get("access_token")
+        id_token = token_data.get("id_token")
+
+        if id_token:
+            google_payload = verify_token(id_token)
+            if google_payload:
+                email = google_payload.get("email", "")
+                name = google_payload.get("name", email)
             else:
                 user_info = await get_user_info_from_google(access_token)
                 email = user_info.get("email", "")
                 name = user_info.get("name", email)
+        else:
+            user_info = await get_user_info_from_google(access_token)
+            email = user_info.get("email", "")
+            name = user_info.get("name", email)
 
-            if not email:
-                return JSONResponse({"error": "Could not determine email"}, status_code=400)
+        if not email:
+            return JSONResponse({"error": "Could not determine email"}, status_code=400)
+        if db is None:
+            return JSONResponse({"error": "MongoDB not configured"}, status_code=500)
 
-            if db is None:
-                return JSONResponse({"error": "MongoDB not configured"}, status_code=500)
+        user_id, role, master_user_id = await _register_user(email, name)
+        jwt_token = create_jwt(user_id, email, name, role, master_user_id)
+        return JSONResponse({
+            "access_token": jwt_token,
+            "token_type": "bearer",
+            "expires_in": 86400,
+        })
 
-            users = users_collection
-            existing = await users.find_one({"email": email})
+    except Exception as e:
+        return JSONResponse({"error": f"Token exchange failed: {e}"}, status_code=400)
 
-            if existing:
-                user_id = existing["user_id"]
-                role = existing["role"]
-                master_user_id = existing.get("master_user_id", user_id)
-                await users.update_one(
-                    {"_id": existing["_id"]},
-                    {"$set": {"last_login": datetime.now(timezone.utc)}},
-                )
-            else:
-                master_doc = await users.find_one({"role": "master", "family_emails": email})
-                if master_doc:
-                    user_id = generate_user_id()
-                    role = "family"
-                    master_user_id = master_doc["user_id"]
-                    await users.insert_one({
-                        "email": email, "name": name, "role": "family",
-                        "user_id": user_id, "master_user_id": master_user_id,
-                        "created_at": datetime.now(timezone.utc),
-                        "last_login": datetime.now(timezone.utc),
-                    })
-                else:
-                    user_id = generate_user_id()
-                    role = "master"
-                    master_user_id = user_id
-                    await users.insert_one({
-                        "email": email, "name": name, "role": "master",
-                        "user_id": user_id, "master_user_id": user_id,
-                        "family_emails": [], "family_members": [],
-                        "created_at": datetime.now(timezone.utc),
-                        "last_login": datetime.now(timezone.utc),
-                    })
-                    for suffix in DEFAULT_SCHEMAS:
-                        coll_name = _prefixed(suffix, AuthContext(user_id, email, name, role, master_user_id))
-                        coll = db[coll_name]
-                        await coll.insert_one({"_init": True})
-                        await coll.delete_one({"_init": True})
-                    schemas_coll = db[f"{user_id}__collection_schemas"]
-                    for suffix, fields in DEFAULT_SCHEMAS.items():
-                        await schemas_coll.insert_one({"name": suffix, "fields": fields})
 
-            jwt_token = create_jwt(user_id, email, name, role, master_user_id)
-            return JSONResponse({
-                "access_token": jwt_token,
-                "token_type": "bearer",
-                "expires_in": 86400,
-            })
-
-        except Exception as e:
-            return JSONResponse({"error": f"Token exchange failed: {e}"}, status_code=400)
-
-    return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
 
 # ---------------------------------------------------------------------------
