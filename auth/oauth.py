@@ -118,7 +118,7 @@ def verify_token(token: str) -> dict | None:
         return None
 
 
-def create_jwt(user_id: str, email: str, name: str, role: str, master_user_id: str) -> str:
+def create_jwt(user_id: str, email: str, name: str, role: str, master_user_id: str, issuer: str = "") -> str:
     payload = {
         "sub": user_id,
         "email": email,
@@ -128,6 +128,8 @@ def create_jwt(user_id: str, email: str, name: str, role: str, master_user_id: s
         "iat": int(time.time()),
         "exp": int(time.time()) + (JWT_EXPIRY_HOURS * 3600),
     }
+    if issuer:
+        payload["iss"] = issuer
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 

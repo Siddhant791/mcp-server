@@ -157,9 +157,11 @@ async def _well_known(request: Request) -> JSONResponse:
         "registration_endpoint": f"{base}/register",
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code"],
-        "token_endpoint_auth_methods_supported": ["none", "client_secret_post"],
+        "token_endpoint_auth_methods_supported": ["none"],
         "scopes_supported": ["openid", "email", "profile"],
         "code_challenge_methods_supported": ["S256"],
+        "client_id_metadata_document_supported": True,
+        "authorization_response_iss_parameter_supported": True,
     })
 
 
@@ -176,13 +178,18 @@ async def _openid_configuration(request: Request) -> JSONResponse:
         "scopes_supported": ["openid", "email", "profile"],
         "token_endpoint_auth_methods_supported": ["none"],
         "code_challenge_methods_supported": ["S256"],
+        "client_id_metadata_document_supported": True,
+        "authorization_response_iss_parameter_supported": True,
     })
 
 
 async def _protected_resource(request: Request) -> JSONResponse:
+    base = str(request.base_url).rstrip("/")
     return JSONResponse({
-        "resource": str(request.base_url),
-        "authorization_servers": [str(request.base_url).rstrip("/")],
+        "resource": base,
+        "authorization_servers": [base],
+        "scopes_supported": ["openid", "email", "profile"],
+        "bearer_methods_supported": ["header"],
     })
 
 
@@ -191,6 +198,9 @@ async def _authorize(request: Request) -> RedirectResponse:
     code_challenge = request.query_params.get("code_challenge", "")
     code_challenge_method = request.query_params.get("code_challenge_method", "S256")
     chatgpt_state = request.query_params.get("state", "")
+    resource = request.query_params.get("resource", "")
+    client_id = request.query_params.get("client_id", "")
+    print(f"[AUTHORIZE] redirect_uri={chatgpt_redirect[:80]}... state={chatgpt_state[:20] if chatgpt_state else 'None'}... resource={resource} client_id={client_id[:40] if client_id else 'None'}", flush=True)
     google_state = secrets.token_urlsafe(32)
     if db is not None:
         await db["_oauth_states"].insert_one({
@@ -199,6 +209,8 @@ async def _authorize(request: Request) -> RedirectResponse:
             "chatgpt_state": chatgpt_state,
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
+            "resource": resource,
+            "client_id": client_id,
             "created_at": datetime.now(timezone.utc),
         })
     server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
@@ -293,7 +305,8 @@ async def _callback(request: Request):
         return HTMLResponse("<html><body>MongoDB not configured</body></html>", status_code=500)
 
     user_id, role, master_user_id = await _register_user(email, name)
-    jwt_token = create_jwt(user_id, email, name, role, master_user_id)
+    server_base = str(request.base_url).rstrip("/")
+    jwt_token = create_jwt(user_id, email, name, role, master_user_id, issuer=server_base)
 
     server_code = secrets.token_urlsafe(32)
     code_challenge = stored_state.get("code_challenge", "")
@@ -328,12 +341,21 @@ async def _register(request: Request) -> JSONResponse:
     client_name = body.get("client_name", "mcp-client")
     client_id = "mcp_client_" + secrets.token_hex(8)
     client_secret = secrets.token_hex(24)
-    _registered_clients[client_id] = {
-        "client_name": client_name,
-        "client_secret": client_secret,
-        "redirect_uris": body.get("redirect_uris", []),
-        "created_at": datetime.now(timezone.utc).isoformat(),
-    }
+    if db is not None:
+        await db["_registered_clients"].insert_one({
+            "client_id": client_id,
+            "client_name": client_name,
+            "client_secret": client_secret,
+            "redirect_uris": body.get("redirect_uris", []),
+            "created_at": datetime.now(timezone.utc),
+        })
+    else:
+        _registered_clients[client_id] = {
+            "client_name": client_name,
+            "client_secret": client_secret,
+            "redirect_uris": body.get("redirect_uris", []),
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
     return JSONResponse({
         "client_id": client_id,
         "client_name": client_name,
@@ -358,7 +380,7 @@ async def _token(request: Request) -> JSONResponse:
         code = body.get("code", "")
         code_verifier = body.get("code_verifier", "")
         client_id = body.get("client_id", "")
-        print(f"[TOKEN] grant_type={grant_type} code={code[:10] if code else 'None'}... has_verifier={bool(code_verifier)} client_id={client_id[:20] if client_id else 'None'}... ct={content_type}", flush=True)
+        print(f"[TOKEN] grant_type={grant_type} code={code[:10] if code else 'None'}... has_verifier={bool(code_verifier)} client_id={client_id[:40] if client_id else 'None'}... ct={content_type}", flush=True)
 
         if grant_type != "authorization_code":
             return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
@@ -372,6 +394,13 @@ async def _token(request: Request) -> JSONResponse:
             print("[TOKEN] db is None!", flush=True)
 
         if auth_info:
+            created_at = auth_info.get("created_at")
+            if created_at:
+                age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
+                if age_seconds > 600:
+                    print(f"[TOKEN] Code expired (age={age_seconds:.0f}s)", flush=True)
+                    return JSONResponse({"error": "invalid_grant", "detail": "Authorization code expired"}, status_code=400)
+
             stored_challenge = auth_info.get("code_challenge", "")
             if stored_challenge and code_verifier:
                 computed = base64.urlsafe_b64encode(
@@ -390,10 +419,16 @@ async def _token(request: Request) -> JSONResponse:
         print(f"[TOKEN] Code not found in MongoDB, trying Google fallback", flush=True)
         client_secret = body.get("client_secret", "")
 
-        if client_id and client_id in _registered_clients:
+        if client_id and client_id.startswith("https://"):
+            print(f"[TOKEN] CIMD client_id detected: {client_id[:60]}", flush=True)
+        elif client_id and client_id in _registered_clients:
             expected_secret = _registered_clients[client_id].get("client_secret", "")
             if client_secret and client_secret != expected_secret:
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
+        elif client_id and db is not None:
+            registered = await db["_registered_clients"].find_one({"client_id": client_id})
+            if not registered and not client_id.startswith("https://"):
+                print(f"[TOKEN] Unknown client_id: {client_id[:40]}", flush=True)
 
         server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
         token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=server_callback)
@@ -420,7 +455,8 @@ async def _token(request: Request) -> JSONResponse:
             return JSONResponse({"error": "MongoDB not configured"}, status_code=500)
 
         user_id, role, master_user_id = await _register_user(email, name)
-        jwt_token = create_jwt(user_id, email, name, role, master_user_id)
+        server_base = str(request.base_url).rstrip("/")
+        jwt_token = create_jwt(user_id, email, name, role, master_user_id, issuer=server_base)
         return JSONResponse({
             "access_token": jwt_token,
             "token_type": "bearer",
