@@ -15,6 +15,8 @@ from mcp.server.mcpserver.server import MCPServer
 from auth.middleware import AuthMiddleware, get_current_user, require_auth, require_master
 from auth.models import AuthContext, FamilyMember, generate_user_id
 from auth.oauth import (
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
     GOOGLE_REDIRECT_URI,
     create_jwt,
     exchange_code_for_token,
@@ -188,11 +190,13 @@ async def _authorize(request: Request) -> RedirectResponse:
     chatgpt_redirect = request.query_params.get("redirect_uri", "")
     code_challenge = request.query_params.get("code_challenge", "")
     code_challenge_method = request.query_params.get("code_challenge_method", "S256")
+    chatgpt_state = request.query_params.get("state", "")
     google_state = secrets.token_urlsafe(32)
     if db is not None:
         await db["_oauth_states"].insert_one({
             "state": google_state,
             "chatgpt_redirect_uri": chatgpt_redirect,
+            "chatgpt_state": chatgpt_state,
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
             "created_at": datetime.now(timezone.utc),
@@ -270,6 +274,7 @@ async def _callback(request: Request):
         return HTMLResponse("<html><body>Invalid or expired state</body></html>", status_code=400)
 
     chatgpt_redirect = stored_state.get("chatgpt_redirect_uri", "")
+    chatgpt_state = stored_state.get("chatgpt_state", "")
 
     try:
         server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
@@ -305,8 +310,11 @@ async def _callback(request: Request):
     if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
         sep = "&" if "?" in chatgpt_redirect else "?"
-        redirect_url = f"{chatgpt_redirect}{sep}{_urlencode({'code': server_code, 'state': google_state})}"
-        print(f"[CALLBACK] REDIRECTING to ChatGPT: {redirect_url[:100]}...", flush=True)
+        params = {"code": server_code}
+        if chatgpt_state:
+            params["state"] = chatgpt_state
+        redirect_url = f"{chatgpt_redirect}{sep}{_urlencode(params)}"
+        print(f"[CALLBACK] REDIRECTING to ChatGPT: {redirect_url[:120]}...", flush=True)
         return RedirectResponse(redirect_url)
 
     print("[CALLBACK] NO chatgpt_redirect — returning HTML fallback", flush=True)
@@ -341,12 +349,14 @@ async def _token(request: Request) -> JSONResponse:
     import hashlib, base64
     body = await request.json()
     grant_type = body.get("grant_type")
+    code = body.get("code", "")
+    code_verifier = body.get("code_verifier", "")
+    client_id = body.get("client_id", "")
+    print(f"[TOKEN] grant_type={grant_type} code={code[:10] if code else 'None'}... has_verifier={bool(code_verifier)} client_id={client_id[:20] if client_id else 'None'}...", flush=True)
 
     if grant_type != "authorization_code":
         return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
-    code = body.get("code", "")
-    code_verifier = body.get("code_verifier", "")
     auth_info = None
     if db is not None:
         auth_info = await db["_oauth_codes"].find_one_and_delete({"code": code})
@@ -358,14 +368,16 @@ async def _token(request: Request) -> JSONResponse:
                 hashlib.sha256(code_verifier.encode()).digest()
             ).rstrip(b"=").decode()
             if computed != stored_challenge:
+                print(f"[TOKEN] PKCE FAILED stored={stored_challenge} computed={computed}", flush=True)
                 return JSONResponse({"error": "invalid_grant", "detail": "PKCE verification failed"}, status_code=400)
+        print(f"[TOKEN] SUCCESS - returning JWT", flush=True)
         return JSONResponse({
             "access_token": auth_info["jwt_token"],
             "token_type": "bearer",
             "expires_in": 86400,
         })
 
-    client_id = body.get("client_id", "")
+    print(f"[TOKEN] Code not found in MongoDB, trying Google fallback", flush=True)
     client_secret = body.get("client_secret", "")
 
     if client_id and client_id in _registered_clients:
@@ -407,6 +419,7 @@ async def _token(request: Request) -> JSONResponse:
         })
 
     except Exception as e:
+        print(f"[TOKEN] ERROR: {e}", flush=True)
         return JSONResponse({"error": f"Token exchange failed: {e}"}, status_code=400)
 
 

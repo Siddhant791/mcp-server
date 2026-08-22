@@ -21,6 +21,14 @@ def get_current_user() -> AuthContext | None:
     return user_context.get()
 
 
+_CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Max-Age": "600",
+}
+
+
 class AuthMiddleware(BaseHTTPMiddleware):
     def __init__(self, app: ASGIApp) -> None:
         super().__init__(app)
@@ -28,10 +36,16 @@ class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
 
+        if request.method == "OPTIONS":
+            return JSONResponse({}, status_code=204, headers=_CORS_HEADERS)
+
         if path.startswith("/.well-known") or path in ("/authorize", "/auth/callback", "/register", "/token"):
             tok = user_context.set(None)
             try:
-                return await call_next(request)
+                response = await call_next(request)
+                for k, v in _CORS_HEADERS.items():
+                    response.headers[k] = v
+                return response
             finally:
                 user_context.reset(tok)
 
