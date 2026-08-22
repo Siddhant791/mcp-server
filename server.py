@@ -171,12 +171,13 @@ async def _protected_resource(request: Request) -> JSONResponse:
 
 async def _authorize(request: Request) -> RedirectResponse:
     state = secrets.token_urlsafe(32)
-    redirect_uri = request.query_params.get("redirect_uri", GOOGLE_REDIRECT_URI)
+    redirect_uri = request.query_params.get("redirect_uri", "")
     _authorization_codes[state] = {
         "created": datetime.now(timezone.utc).isoformat(),
-        "redirect_uri": redirect_uri,
+        "chatgpt_redirect_uri": redirect_uri,
     }
-    url = get_google_auth_url(state, redirect_uri=redirect_uri)
+    server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
+    url = get_google_auth_url(state, redirect_uri=server_callback)
     return RedirectResponse(url)
 
 
@@ -191,7 +192,8 @@ async def _callback(request: Request) -> JSONResponse:
         return JSONResponse({"error": "Invalid or expired state"}, status_code=400)
 
     try:
-        token_data = await exchange_code_for_token(code, redirect_uri=stored.get("redirect_uri", ""))
+        server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
+        token_data = await exchange_code_for_token(code, redirect_uri=server_callback)
         access_token = token_data["access_token"]
         user_info = await get_user_info_from_google(access_token)
     except Exception as e:
@@ -259,11 +261,11 @@ async def _callback(request: Request) -> JSONResponse:
 
     jwt_token = create_jwt(user_id, email, name, role, master_user_id)
 
-    redirect_uri = stored.get("redirect_uri", "")
-    if redirect_uri:
+    chatgpt_redirect = stored.get("chatgpt_redirect_uri", "")
+    if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
-        sep = "&" if "?" in redirect_uri else "?"
-        return RedirectResponse(f"{redirect_uri}{sep}{_urlencode({'access_token': jwt_token, 'token_type': 'bearer'})}")
+        sep = "&" if "?" in chatgpt_redirect else "?"
+        return RedirectResponse(f"{chatgpt_redirect}{sep}{_urlencode({'access_token': jwt_token, 'token_type': 'bearer'})}")
 
     return JSONResponse({
         "access_token": jwt_token,
@@ -313,8 +315,8 @@ async def _token(request: Request) -> JSONResponse:
                 return JSONResponse({"error": "invalid_client"}, status_code=401)
 
         try:
-            redirect_uri = body.get("redirect_uri", GOOGLE_REDIRECT_URI)
-            token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=redirect_uri)
+            server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
+            token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=server_callback)
             access_token = token_data.get("access_token")
             id_token = token_data.get("id_token")
 
