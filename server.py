@@ -347,8 +347,13 @@ async def _register(request: Request) -> JSONResponse:
 
 async def _token(request: Request) -> JSONResponse:
     import hashlib, base64
-    body = await request.json()
-    grant_type = body.get("grant_type")
+    content_type = request.headers.get("content-type", "")
+    if "application/json" in content_type:
+        body = await request.json()
+    else:
+        form = await request.form()
+        body = dict(form)
+    grant_type = body.get("grant_type", "")
     code = body.get("code", "")
     code_verifier = body.get("code_verifier", "")
     client_id = body.get("client_id", "")
