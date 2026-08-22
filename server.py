@@ -347,50 +347,54 @@ async def _register(request: Request) -> JSONResponse:
 
 async def _token(request: Request) -> JSONResponse:
     import hashlib, base64
-    content_type = request.headers.get("content-type", "")
-    if "application/json" in content_type:
-        body = await request.json()
-    else:
-        form = await request.form()
-        body = dict(form)
-    grant_type = body.get("grant_type", "")
-    code = body.get("code", "")
-    code_verifier = body.get("code_verifier", "")
-    client_id = body.get("client_id", "")
-    print(f"[TOKEN] grant_type={grant_type} code={code[:10] if code else 'None'}... has_verifier={bool(code_verifier)} client_id={client_id[:20] if client_id else 'None'}...", flush=True)
-
-    if grant_type != "authorization_code":
-        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
-
-    auth_info = None
-    if db is not None:
-        auth_info = await db["_oauth_codes"].find_one_and_delete({"code": code})
-
-    if auth_info:
-        stored_challenge = auth_info.get("code_challenge", "")
-        if stored_challenge and code_verifier:
-            computed = base64.urlsafe_b64encode(
-                hashlib.sha256(code_verifier.encode()).digest()
-            ).rstrip(b"=").decode()
-            if computed != stored_challenge:
-                print(f"[TOKEN] PKCE FAILED stored={stored_challenge} computed={computed}", flush=True)
-                return JSONResponse({"error": "invalid_grant", "detail": "PKCE verification failed"}, status_code=400)
-        print(f"[TOKEN] SUCCESS - returning JWT", flush=True)
-        return JSONResponse({
-            "access_token": auth_info["jwt_token"],
-            "token_type": "bearer",
-            "expires_in": 86400,
-        })
-
-    print(f"[TOKEN] Code not found in MongoDB, trying Google fallback", flush=True)
-    client_secret = body.get("client_secret", "")
-
-    if client_id and client_id in _registered_clients:
-        expected_secret = _registered_clients[client_id].get("client_secret", "")
-        if client_secret and client_secret != expected_secret:
-            return JSONResponse({"error": "invalid_client"}, status_code=401)
-
     try:
+        content_type = request.headers.get("content-type", "")
+        if "application/json" in content_type:
+            body = await request.json()
+        else:
+            form = await request.form()
+            body = dict(form)
+        grant_type = body.get("grant_type", "")
+        code = body.get("code", "")
+        code_verifier = body.get("code_verifier", "")
+        client_id = body.get("client_id", "")
+        print(f"[TOKEN] grant_type={grant_type} code={code[:10] if code else 'None'}... has_verifier={bool(code_verifier)} client_id={client_id[:20] if client_id else 'None'}... ct={content_type}", flush=True)
+
+        if grant_type != "authorization_code":
+            return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+        auth_info = None
+        if db is not None:
+            print(f"[TOKEN] Looking up code in _oauth_codes...", flush=True)
+            auth_info = await db["_oauth_codes"].find_one_and_delete({"code": code})
+            print(f"[TOKEN] MongoDB lookup result: {'found' if auth_info else 'not found'}", flush=True)
+        else:
+            print("[TOKEN] db is None!", flush=True)
+
+        if auth_info:
+            stored_challenge = auth_info.get("code_challenge", "")
+            if stored_challenge and code_verifier:
+                computed = base64.urlsafe_b64encode(
+                    hashlib.sha256(code_verifier.encode()).digest()
+                ).rstrip(b"=").decode()
+                if computed != stored_challenge:
+                    print(f"[TOKEN] PKCE FAILED stored={stored_challenge} computed={computed}", flush=True)
+                    return JSONResponse({"error": "invalid_grant", "detail": "PKCE verification failed"}, status_code=400)
+            print(f"[TOKEN] SUCCESS - returning JWT", flush=True)
+            return JSONResponse({
+                "access_token": auth_info["jwt_token"],
+                "token_type": "bearer",
+                "expires_in": 86400,
+            })
+
+        print(f"[TOKEN] Code not found in MongoDB, trying Google fallback", flush=True)
+        client_secret = body.get("client_secret", "")
+
+        if client_id and client_id in _registered_clients:
+            expected_secret = _registered_clients[client_id].get("client_secret", "")
+            if client_secret and client_secret != expected_secret:
+                return JSONResponse({"error": "invalid_client"}, status_code=401)
+
         server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
         token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=server_callback)
         access_token = token_data.get("access_token")
@@ -424,7 +428,8 @@ async def _token(request: Request) -> JSONResponse:
         })
 
     except Exception as e:
-        print(f"[TOKEN] ERROR: {e}", flush=True)
+        import traceback
+        print(f"[TOKEN] ERROR: {e}\n{traceback.format_exc()}", flush=True)
         return JSONResponse({"error": f"Token exchange failed: {e}"}, status_code=400)
 
 
