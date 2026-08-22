@@ -760,21 +760,14 @@ async def delete_record(collection: str, record_id: str) -> str:
 # ---------------------------------------------------------------------------
 # Build Starlette app with auth routes + MCP + auth middleware
 # ---------------------------------------------------------------------------
-_routes = [
-    Route("/.well-known/oauth-authorization-server", _well_known, methods=["GET"]),
-    Route("/.well-known/oauth-protected-resource", _protected_resource, methods=["GET"]),
-    Route("/authorize", _authorize, methods=["GET"]),
-    Route("/auth/callback", _callback, methods=["GET"]),
-    Route("/token", _token, methods=["POST"]),
-]
-
 mcp_app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
 
-# Combine auth routes + MCP app
-app = Starlette(routes=_routes)
-# Mount MCP on all other paths
-from starlette.routing import Mount
+# Add auth routes to the MCP Starlette app
+mcp_app.routes.insert(0, Route("/.well-known/oauth-authorization-server", _well_known, methods=["GET"]))
+mcp_app.routes.insert(1, Route("/.well-known/oauth-protected-resource", _protected_resource, methods=["GET"]))
+mcp_app.routes.insert(2, Route("/authorize", _authorize, methods=["GET"]))
+mcp_app.routes.insert(3, Route("/auth/callback", _callback, methods=["GET"]))
+mcp_app.routes.insert(4, Route("/token", _token, methods=["POST"]))
 
-app.routes.append(Mount("/", app=mcp_app))
 # Wrap with auth middleware
-app = AuthMiddleware(app)
+app = AuthMiddleware(mcp_app)

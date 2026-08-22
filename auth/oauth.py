@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import time
+import urllib.request
+import urllib.error
 from urllib.parse import urlencode
 
-import httpx
 import jwt
 
 GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
@@ -33,29 +35,32 @@ def get_google_auth_url(state: str) -> str:
 
 
 async def exchange_code_for_token(code: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            GOOGLE_TOKEN_URL,
-            data={
-                "code": code,
-                "client_id": GOOGLE_CLIENT_ID,
-                "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uri": GOOGLE_REDIRECT_URI,
-                "grant_type": "authorization_code",
-            },
-        )
-        response.raise_for_status()
-        return response.json()
+    data = urlencode({
+        "code": code,
+        "client_id": GOOGLE_CLIENT_ID,
+        "client_secret": GOOGLE_CLIENT_SECRET,
+        "redirect_uri": GOOGLE_REDIRECT_URI,
+        "grant_type": "authorization_code",
+    }).encode("utf-8")
+    req = urllib.request.Request(GOOGLE_TOKEN_URL, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        raise RuntimeError(f"Google token exchange failed ({e.code}): {body}")
 
 
 async def get_user_info_from_google(access_token: str) -> dict:
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            GOOGLE_USERINFO_URL,
-            headers={"Authorization": f"Bearer {access_token}"},
-        )
-        response.raise_for_status()
-        return response.json()
+    req = urllib.request.Request(GOOGLE_USERINFO_URL)
+    req.add_header("Authorization", f"Bearer {access_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode() if e.fp else ""
+        raise RuntimeError(f"Google userinfo fetch failed ({e.code}): {body}")
 
 
 def create_jwt(user_id: str, email: str, name: str, role: str, master_user_id: str) -> str:
