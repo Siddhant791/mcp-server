@@ -396,6 +396,8 @@ async def _token(request: Request) -> JSONResponse:
         if auth_info:
             created_at = auth_info.get("created_at")
             if created_at:
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
                 age_seconds = (datetime.now(timezone.utc) - created_at).total_seconds()
                 if age_seconds > 600:
                     print(f"[TOKEN] Code expired (age={age_seconds:.0f}s)", flush=True)
