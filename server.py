@@ -186,7 +186,7 @@ async def _openid_configuration(request: Request) -> JSONResponse:
 async def _protected_resource(request: Request) -> JSONResponse:
     base = str(request.base_url).rstrip("/")
     return JSONResponse({
-        "resource": base,
+        "resource": base + '/mcp',
         "authorization_servers": [base],
         "scopes_supported": ["openid", "email", "profile"],
         "bearer_methods_supported": ["header"],
