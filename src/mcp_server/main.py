@@ -4,6 +4,7 @@ mcp = MCPServer(name="todo-server")
 
 todos: list[dict] = []
 guest_collections: dict[str, list[dict]] = {"engagement": [], "marriage": []}
+collection_schemas: dict[str, dict] = {}
 
 
 @mcp.tool()
@@ -208,15 +209,79 @@ def get_gifts(collection: str, guest_name: str = "") -> list[dict]:
 
 
 @mcp.tool()
-def create_collection(name: str) -> str:
-    """Create a new collection for any wedding-related activity (e.g. catering, decorator_payments, venue_bookings). The collection name should be descriptive with underscores. After creation, use it as the collection parameter in other guest tools."""
+def create_collection(name: str, fields: dict = {}) -> str:
+    """Create a new collection with a defined schema for any wedding-related activity. name is the collection name (use underscores, e.g. 'vendors', 'catering', 'decorator_payments'). fields is a dict defining the schema with field names as keys and their default values, e.g. {"vendor_name": null, "place": null, "price": null, "description": null, "item": null, "comments": null}. All fields default to null if not provided. After creation, use add_record, get_records, update_record, and delete_record to manage data in this collection."""
     clean_name = name.strip()
     if not clean_name:
         return "Collection name cannot be empty."
     if clean_name in guest_collections:
         return f"Collection '{clean_name}' already exists."
     guest_collections[clean_name] = []
-    return f"Collection '{clean_name}' created successfully. You can now use '{clean_name}' as the collection parameter in guest tools."
+    collection_schemas[clean_name] = fields
+    field_list = ", ".join(fields.keys()) if fields else "none (add fields when inserting records)"
+    return f"Collection '{clean_name}' created with fields: {field_list}. Use add_record to add data, get_records to query, update_record to modify, and delete_record to remove entries."
+
+
+@mcp.tool()
+def add_record(collection: str, data: dict) -> str:
+    """Add a new record to any collection. Pass the collection name (predefined like 'engagement'/'marriage', or any dynamically created collection like 'vendors'). data is a dict of field-value pairs, e.g. {"vendor_name": "Sharma Caterers", "place": "Delhi", "price": 50000}. Fields not provided will default to null based on the collection schema. For guest collections, use the specialized add_guest tool instead."""
+    if collection not in guest_collections:
+        return f"Invalid collection '{collection}'."
+    schema = collection_schemas.get(collection)
+    if schema is not None:
+        record = {field: data.get(field, default) for field, default in schema.items()}
+        for key, value in data.items():
+            if key not in record:
+                record[key] = value
+    else:
+        record = dict(data)
+    record.setdefault("deleted", False)
+    record["_id"] = str(len(guest_collections[collection]) + 1)
+    guest_collections[collection].append(record)
+    return f"Record added to '{collection}' (id: {record['_id']})."
+
+
+@mcp.tool()
+def get_records(collection: str, filters: dict = {}) -> list[dict]:
+    """Get records from any collection. Pass the collection name. Optionally pass filters as key-value pairs to narrow results, e.g. {"place": "Delhi"}. By default only non-deleted records are returned. For guest collections, use the specialized get_guests tool instead."""
+    if collection not in guest_collections:
+        return [{"error": f"Invalid collection '{collection}'."}]
+    results = []
+    for rec in guest_collections[collection]:
+        if rec.get("deleted", False):
+            continue
+        match = True
+        for key, value in filters.items():
+            if rec.get(key) != value:
+                match = False
+                break
+        if match:
+            results.append(rec)
+    return results
+
+
+@mcp.tool()
+def update_record(collection: str, record_id: str, updates: dict) -> str:
+    """Update fields on a specific record. Pass the collection name, the record's _id (string), and a dict of fields to update, e.g. {"price": 60000, "comments": "Updated quote"}. Only the provided fields are changed. For guest collections, use the specialized tools instead."""
+    if collection not in guest_collections:
+        return f"Invalid collection '{collection}'."
+    for rec in guest_collections[collection]:
+        if rec.get("_id") == record_id:
+            rec.update(updates)
+            return f"Record '{record_id}' updated in '{collection}'."
+    return f"Record '{record_id}' not found in '{collection}'."
+
+
+@mcp.tool()
+def delete_record(collection: str, record_id: str) -> str:
+    """Soft delete a record from any collection. Pass the collection name and the record's _id (string). The record stays in DB but is excluded from default queries. For guest collections, use the specialized remove_guest tool instead."""
+    if collection not in guest_collections:
+        return f"Invalid collection '{collection}'."
+    for rec in guest_collections[collection]:
+        if rec.get("_id") == record_id:
+            rec["deleted"] = True
+            return f"Record '{record_id}' deleted from '{collection}'."
+    return f"Record '{record_id}' not found in '{collection}'."
 
 
 if __name__ == "__main__":
