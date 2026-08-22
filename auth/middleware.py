@@ -24,7 +24,8 @@ def get_current_user() -> AuthContext | None:
 _CORS_HEADERS = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, Mcp-Session-Id",
+    "Access-Control-Expose-Headers": "Mcp-Session-Id",
     "Access-Control-Max-Age": "600",
 }
 
@@ -76,6 +77,8 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 tok = user_context.set(ctx)
                 try:
                     response = await call_next(request)
+                    for k, v in _CORS_HEADERS.items():
+                        response.headers[k] = v
                     return response
                 finally:
                     user_context.reset(tok)
