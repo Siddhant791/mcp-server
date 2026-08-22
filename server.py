@@ -181,15 +181,16 @@ async def _authorize(request: Request) -> RedirectResponse:
     return RedirectResponse(url)
 
 
-async def _callback(request: Request) -> JSONResponse:
+async def _callback(request: Request):
+    from starlette.responses import HTMLResponse
     code = request.query_params.get("code")
     state = request.query_params.get("state")
     if not code or not state:
-        return JSONResponse({"error": "Missing code or state"}, status_code=400)
+        return HTMLResponse("<html><body>Missing code or state</body></html>", status_code=400)
 
     stored = _authorization_codes.pop(state, None)
     if not stored:
-        return JSONResponse({"error": "Invalid or expired state"}, status_code=400)
+        return HTMLResponse("<html><body>Invalid or expired state</body></html>", status_code=400)
 
     try:
         server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
@@ -197,15 +198,15 @@ async def _callback(request: Request) -> JSONResponse:
         access_token = token_data["access_token"]
         user_info = await get_user_info_from_google(access_token)
     except Exception as e:
-        return JSONResponse({"error": f"Google OAuth failed: {e}"}, status_code=500)
+        return HTMLResponse(f"<html><body>Google OAuth failed: {e}</body></html>", status_code=500)
 
     email = user_info.get("email", "")
     name = user_info.get("name", email)
     if not email:
-        return JSONResponse({"error": "Could not determine email from Google"}, status_code=400)
+        return HTMLResponse("<html><body>Could not determine email</body></html>", status_code=400)
 
     if db is None:
-        return JSONResponse({"error": "MongoDB not configured"}, status_code=500)
+        return HTMLResponse("<html><body>MongoDB not configured</body></html>", status_code=500)
 
     users = users_collection
     existing = await users.find_one({"email": email})
@@ -227,11 +228,8 @@ async def _callback(request: Request) -> JSONResponse:
             role = "family"
             master_user_id = master_doc["user_id"]
             await users.insert_one({
-                "email": email,
-                "name": name,
-                "role": "family",
-                "user_id": user_id,
-                "master_user_id": master_user_id,
+                "email": email, "name": name, "role": "family",
+                "user_id": user_id, "master_user_id": master_user_id,
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             })
@@ -240,13 +238,9 @@ async def _callback(request: Request) -> JSONResponse:
             role = "master"
             master_user_id = user_id
             await users.insert_one({
-                "email": email,
-                "name": name,
-                "role": "master",
-                "user_id": user_id,
-                "master_user_id": user_id,
-                "family_emails": [],
-                "family_members": [],
+                "email": email, "name": name, "role": "master",
+                "user_id": user_id, "master_user_id": user_id,
+                "family_emails": [], "family_members": [],
                 "created_at": datetime.now(timezone.utc),
                 "last_login": datetime.now(timezone.utc),
             })
@@ -261,22 +255,31 @@ async def _callback(request: Request) -> JSONResponse:
 
     jwt_token = create_jwt(user_id, email, name, role, master_user_id)
 
+    import html as _html
+    safe_token = _html.escape(jwt_token)
+
     chatgpt_redirect = stored.get("chatgpt_redirect_uri", "")
     if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
         sep = "&" if "?" in chatgpt_redirect else "?"
         return RedirectResponse(f"{chatgpt_redirect}{sep}{_urlencode({'access_token': jwt_token, 'token_type': 'bearer'})}")
 
-    return JSONResponse({
-        "access_token": jwt_token,
-        "token_type": "bearer",
-        "expires_in": 86400,
-        "user_id": user_id,
-        "role": role,
-        "message": f"Welcome {name}! You are registered as {role}."
-        if role == "master"
-        else f"Welcome {name}! You have family access.",
-    })
+    return HTMLResponse(f"""<!DOCTYPE html>
+<html><head><title>Auth Complete</title></head>
+<body>
+<script>
+(function() {{
+  var token = "{safe_token}";
+  if (window.opener) {{
+    window.opener.postMessage({{type: "oauth_token", access_token: token, token_type: "bearer"}}, "*");
+    window.close();
+  }} else {{
+    document.body.innerHTML = "<p>Authentication successful. You can close this window.</p>";
+  }}
+}})();
+</script>
+<p>Authenticating...</p>
+</body></html>""")
 
 
 async def _register(request: Request) -> JSONResponse:
