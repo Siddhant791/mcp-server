@@ -160,6 +160,21 @@ async def _well_known(request: Request) -> JSONResponse:
     })
 
 
+async def _openid_configuration(request: Request) -> JSONResponse:
+    base = str(request.base_url).rstrip("/")
+    return JSONResponse({
+        "issuer": base,
+        "authorization_endpoint": f"{base}/authorize",
+        "token_endpoint": f"{base}/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+        "scopes_supported": ["openid", "email", "profile"],
+        "token_endpoint_auth_methods_supported": ["none"],
+    })
+
+
 async def _protected_resource(request: Request) -> JSONResponse:
     return JSONResponse({
         "resource": str(request.base_url),
@@ -235,12 +250,16 @@ async def _callback(request: Request):
     code = request.query_params.get("code")
     google_state = request.query_params.get("state")
 
+    print(f"[CALLBACK] code={code[:10] if code else 'None'}... state={google_state[:10] if google_state else 'None'}...", flush=True)
+
     if not code or not google_state:
+        print("[CALLBACK] ERROR: Missing code or state", flush=True)
         return HTMLResponse("<html><body>Missing code or state</body></html>", status_code=400)
 
     stored_state = None
     if db is not None:
         stored_state = await db["_oauth_states"].find_one_and_delete({"state": google_state})
+    print(f"[CALLBACK] stored_state={stored_state is not None}, chatgpt_redirect={stored_state.get('chatgpt_redirect_uri', 'EMPTY') if stored_state else 'NOT FOUND'}", flush=True)
     if not stored_state:
         return HTMLResponse("<html><body>Invalid or expired state</body></html>", status_code=400)
 
@@ -273,11 +292,16 @@ async def _callback(request: Request):
             "created_at": datetime.now(timezone.utc),
         })
 
+    print(f"[CALLBACK] user={email} role={role} jwt_len={len(jwt_token)} server_code={server_code[:10]}...", flush=True)
+
     if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
         sep = "&" if "?" in chatgpt_redirect else "?"
-        return RedirectResponse(f"{chatgpt_redirect}{sep}{_urlencode({'code': server_code, 'state': google_state})}")
+        redirect_url = f"{chatgpt_redirect}{sep}{_urlencode({'code': server_code, 'state': google_state})}"
+        print(f"[CALLBACK] REDIRECTING to ChatGPT: {redirect_url[:100]}...", flush=True)
+        return RedirectResponse(redirect_url)
 
+    print("[CALLBACK] NO chatgpt_redirect — returning HTML fallback", flush=True)
     return HTMLResponse("""<!DOCTYPE html>
 <html><head><title>Auth Complete</title></head>
 <body><p>Authentication successful. You can close this window.</p></body></html>""")
@@ -867,10 +891,11 @@ mcp_app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
 # Add auth routes to the MCP Starlette app
 mcp_app.routes.insert(0, Route("/.well-known/oauth-authorization-server", _well_known, methods=["GET"]))
 mcp_app.routes.insert(1, Route("/.well-known/oauth-protected-resource", _protected_resource, methods=["GET"]))
-mcp_app.routes.insert(2, Route("/authorize", _authorize, methods=["GET"]))
-mcp_app.routes.insert(3, Route("/auth/callback", _callback, methods=["GET"]))
-mcp_app.routes.insert(4, Route("/token", _token, methods=["POST"]))
-mcp_app.routes.insert(5, Route("/register", _register, methods=["POST"]))
+mcp_app.routes.insert(2, Route("/.well-known/openid-configuration", _openid_configuration, methods=["GET"]))
+mcp_app.routes.insert(3, Route("/authorize", _authorize, methods=["GET"]))
+mcp_app.routes.insert(4, Route("/auth/callback", _callback, methods=["GET"]))
+mcp_app.routes.insert(5, Route("/token", _token, methods=["POST"]))
+mcp_app.routes.insert(6, Route("/register", _register, methods=["POST"]))
 
 # Wrap with auth middleware
 app = AuthMiddleware(mcp_app)
