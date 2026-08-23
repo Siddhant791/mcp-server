@@ -572,7 +572,7 @@ async def get_todos() -> list[dict]:
     if db is None:
         return [{"error": "MongoDB not configured."}]
     coll = db[_prefixed("todos", ctx)]
-    cursor = coll.find({})
+    cursor = coll.find({"deleted": {"$ne": True}})
     todos = []
     async for doc in cursor:
         doc["_id"] = str(doc["_id"])
@@ -592,7 +592,7 @@ async def add_todo(title: str) -> str:
     if db is None:
         return "Error: MongoDB not configured."
     coll = db[_prefixed("todos", ctx)]
-    todo = {"title": title, "completed": False}
+    todo = {"title": title, "completed": False, "deleted": False}
     result = await coll.insert_one(todo)
     return f"Added todo: {title} (id: {result.inserted_id})"
 
@@ -609,9 +609,9 @@ async def toggle_todo(title: str) -> str:
     if db is None:
         return "Error: MongoDB not configured."
     coll = db[_prefixed("todos", ctx)]
-    doc = await coll.find_one({"title": title})
+    doc = await coll.find_one({"title": title, "deleted": {"$ne": True}})
     if not doc:
-        available = await coll.distinct("title")
+        available = await coll.distinct("title", {"deleted": {"$ne": True}})
         if available:
             return f"Todo '{title}' not found. Available: {', '.join(available)}"
         return f"Todo '{title}' not found. The todo list is empty."
@@ -623,7 +623,7 @@ async def toggle_todo(title: str) -> str:
 
 @mcp.tool()
 async def delete_todo(title: str) -> str:
-    """Delete a todo item from the list."""
+    """Soft delete a todo item from the list."""
     ctx = await _get_auth_ctx()
     if ctx.role == "family":
         master_doc = await users_collection.find_one({"user_id": ctx.master_user_id})
@@ -633,12 +633,13 @@ async def delete_todo(title: str) -> str:
     if db is None:
         return "Error: MongoDB not configured."
     coll = db[_prefixed("todos", ctx)]
-    result = await coll.delete_one({"title": title})
-    if result.deleted_count == 0:
-        available = await coll.distinct("title")
+    doc = await coll.find_one({"title": title, "deleted": {"$ne": True}})
+    if not doc:
+        available = await coll.distinct("title", {"deleted": {"$ne": True}})
         if available:
             return f"Todo '{title}' not found. Available: {', '.join(available)}"
         return f"Todo '{title}' not found. The todo list is empty."
+    await coll.update_one({"_id": doc["_id"]}, {"$set": {"deleted": True}})
     return f"Todo '{title}' deleted."
 
 
