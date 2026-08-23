@@ -1008,6 +1008,80 @@ async def delete_record(collection: str, record_id: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Unified collection manager
+# ---------------------------------------------------------------------------
+async def _handle_get_records(ctx: AuthContext, collection: str, **kwargs) -> list[dict]:
+    """Retrieve records from a collection with optional filters."""
+    coll_name = await _resolve(collection, ctx)
+    if not coll_name:
+        return [{"error": f"Invalid collection '{collection}'."}]
+    query = {"deleted": {"$ne": True}}
+    query.update(kwargs.get("filters", {}))
+    cursor = db[coll_name].find(query)
+    records = []
+    async for doc in cursor:
+        doc["_id"] = str(doc["_id"])
+        records.append(doc)
+    return records
+
+
+async def _handle_update_record(ctx: AuthContext, collection: str, **kwargs) -> str:
+    """Update a specific record in a collection."""
+    coll_name = await _resolve(collection, ctx)
+    if not coll_name:
+        return f"Invalid collection '{collection}'."
+    record_id = kwargs.get("record_id", "")
+    updates = kwargs.get("updates", {})
+    if not record_id:
+        return "Error: 'record_id' is required for update operation."
+    if not updates:
+        return "Error: 'updates' dict is required for update operation."
+    try:
+        oid = ObjectId(record_id)
+    except Exception:
+        return f"Invalid record id '{record_id}'."
+    result = await db[coll_name].update_one({"_id": oid}, {"$set": updates})
+    if result.matched_count == 0:
+        return f"Record '{record_id}' not found."
+    return f"Record '{record_id}' updated."
+
+
+_COLLECTION_OPERATIONS: dict[str, callable] = {
+    "get": _handle_get_records,
+    "update": _handle_update_record,
+}
+
+
+@mcp.tool()
+async def manage_collection(
+    collection: str,
+    operation: str,
+    filters: dict = {},
+    record_id: str = "",
+    updates: dict = {},
+) -> list[dict] | str:
+    """Manage records in a user-specific collection.
+
+    Supported operations:
+      - get:     Retrieve records. Use 'filters' to narrow results (e.g. {"status": "active"}).
+      - update:  Update a record. Provide 'record_id' and 'updates' dict (e.g. {"status": "done"}).
+
+    Collections are user-scoped — you can only access your own collections.
+    """
+    ctx = await _get_auth_ctx()
+    if db is None:
+        return "Error: MongoDB not configured."
+    await _load_user_schemas(ctx)
+
+    handler = _COLLECTION_OPERATIONS.get(operation)
+    if not handler:
+        valid = ", ".join(_COLLECTION_OPERATIONS.keys())
+        return f"Invalid operation '{operation}'. Valid operations: {valid}"
+
+    return await handler(ctx, collection, filters=filters, record_id=record_id, updates=updates)
+
+
+# ---------------------------------------------------------------------------
 # Build Starlette app with auth routes + MCP + auth middleware
 # ---------------------------------------------------------------------------
 mcp_app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
