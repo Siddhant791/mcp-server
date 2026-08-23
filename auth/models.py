@@ -14,11 +14,11 @@ class FamilyMember:
         "can_add_guest": True,
         "can_remove_guest": True,
         "can_toggle_invited": True,
-        "can_add_family_members": True,
+        "can_add_family_members": False,
         "can_record_gift": True,
-        "can_create_collection": False,
-        "can_manage_users": False,
-        "can_delete_record": False,
+        "can_create_collection": True,
+        "can_manage_users": True,
+        "can_delete_record": True,
         "can_add_todo": True,
         "can_toggle_todo": True,
     })
@@ -62,6 +62,20 @@ class AuthContext:
         if self.role == "master":
             return True
         return False  # Family permissions are checked separately via user doc
+
+
+FAMILY_DEFAULT_PERMISSIONS: dict = {
+    "can_add_guest": True,
+    "can_remove_guest": True,
+    "can_toggle_invited": True,
+    "can_add_family_members": False,
+    "can_record_gift": True,
+    "can_create_collection": True,
+    "can_manage_users": True,
+    "can_delete_record": True,
+    "can_add_todo": True,
+    "can_toggle_todo": True,
+}
 
 
 def generate_user_id() -> str:

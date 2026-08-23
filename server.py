@@ -13,7 +13,7 @@ from starlette.routing import Route
 from mcp.server.mcpserver.server import MCPServer
 
 from auth.middleware import AuthMiddleware, get_current_user, require_auth, require_master
-from auth.models import AuthContext, FamilyMember, generate_user_id
+from auth.models import AuthContext, FamilyMember, FAMILY_DEFAULT_PERMISSIONS, generate_user_id
 from auth.oauth import (
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
@@ -72,6 +72,9 @@ VALID_GUEST_COLLECTIONS = {
 # Per-request dynamic schemas (populated lazily per user)
 _user_dynamic_collections: dict[str, set[str]] = {}
 _user_schemas: dict[str, dict] = {}
+
+# Track master users whose family members have been migrated to new defaults
+_migrated_masters: set[str] = set()
 
 # Default collection schemas created for every new master user
 DEFAULT_SCHEMAS = {
@@ -630,6 +633,24 @@ async def _check_family_perm(ctx: AuthContext, perm: str) -> str | None:
     master_doc = await users_collection.find_one({"user_id": ctx.master_user_id})
     if not master_doc:
         return f"Permission denied: {perm} requires authentication."
+
+    # Auto-migrate existing family members to new permission defaults (run once per master user)
+    if ctx.master_user_id not in _migrated_masters:
+        _migrated_masters.add(ctx.master_user_id)
+        updated_members = []
+        for m in master_doc.get("family_members", []):
+            new_perms = dict(FAMILY_DEFAULT_PERMISSIONS)
+            new_perms.update(m.get("permissions", {}))
+            new_perms["can_add_family_members"] = False
+            if new_perms != m.get("permissions"):
+                m["permissions"] = new_perms
+                updated_members.append(m)
+        if updated_members:
+            await users_collection.update_one(
+                {"user_id": ctx.master_user_id},
+                {"$set": {"family_members": master_doc.get("family_members", [])}},
+            )
+
     member = next((m for m in master_doc.get("family_members", []) if m["email"] == ctx.email), None)
     if member and not member.get("permissions", {}).get(perm, True):
         return f"Permission denied: {perm} is disabled for your account."
@@ -854,8 +875,10 @@ async def get_gifts(collection: str, guest_name: str = "") -> list[dict]:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 async def create_collection(name: str, fields: dict = {}) -> str:
-    """Create a new collection with a defined schema. Only master can do this. After creation use add_record, get_records, update_record, delete_record."""
-    ctx = require_master()
+    """Create a new collection with a defined schema. After creation use add_record, get_records, update_record, delete_record."""
+    ctx = await _get_auth_ctx()
+    if perm_err := await _check_family_perm(ctx, "can_create_collection"):
+        return perm_err
     if db is None:
         return "Error: MongoDB not configured."
     await _load_user_schemas(ctx)
@@ -942,8 +965,10 @@ async def update_record(collection: str, record_id: str, updates: dict) -> str:
 
 @mcp.tool()
 async def delete_record(collection: str, record_id: str) -> str:
-    """Soft delete a record. Only master can do this."""
-    ctx = require_master()
+    """Soft delete a record."""
+    ctx = await _get_auth_ctx()
+    if perm_err := await _check_family_perm(ctx, "can_delete_record"):
+        return perm_err
     if db is None:
         return "Error: MongoDB not configured."
     await _load_user_schemas(ctx)

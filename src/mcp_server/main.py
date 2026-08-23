@@ -5,13 +5,16 @@ from datetime import datetime, timezone
 from mcp.server.mcpserver.server import MCPServer
 
 from auth.middleware import get_current_user, require_master
-from auth.models import AuthContext, FamilyMember, generate_user_id
+from auth.models import AuthContext, FamilyMember, FAMILY_DEFAULT_PERMISSIONS, generate_user_id
 
 mcp = MCPServer(name="wedding-mcp-server")
 
 _users: dict[str, dict] = {}
 _user_collections: dict[str, dict[str, list[dict]]] = {}
 _user_schemas: dict[str, dict[str, dict]] = {}
+
+# Track master users whose family members have been migrated to new defaults
+_migrated_masters: set[str] = set()
 
 VALID_GUEST_COLLECTIONS = {"engagement": "Guest_list_engagement", "marriage": "Guest_list_marriage"}
 DEFAULT_SCHEMAS = {"Guest_list_engagement": {}, "Guest_list_marriage": {}}
@@ -44,6 +47,16 @@ def _check_perm(ctx: AuthContext, perm: str) -> str | None:
     master = _users.get(ctx.master_user_id)
     if not master:
         return "Master user not found."
+
+    # Auto-migrate existing family members to new permission defaults (run once per master user)
+    if ctx.master_user_id not in _migrated_masters:
+        _migrated_masters.add(ctx.master_user_id)
+        for m in master.get("family_members", []):
+            new_perms = dict(FAMILY_DEFAULT_PERMISSIONS)
+            new_perms.update(m.get("permissions", {}))
+            new_perms["can_add_family_members"] = False
+            m["permissions"] = new_perms
+
     for m in master.get("family_members", []):
         if m["email"] == ctx.email:
             if not m.get("permissions", {}).get(perm, True):
@@ -351,8 +364,12 @@ def get_gifts(collection: str, guest_name: str = "") -> list[dict]:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def create_collection(name: str, fields: dict = {}) -> str:
-    """Create a new collection. Only master can do this."""
-    ctx = require_master()
+    """Create a new collection."""
+    ctx = get_current_user()
+    if ctx is None:
+        return "Not authenticated. Call register_user first."
+    if err := _check_perm(ctx, "can_create_collection"):
+        return err
     clean = name.strip()
     if not clean:
         return "Collection name cannot be empty."
@@ -416,8 +433,12 @@ def update_record(collection: str, record_id: str, updates: dict) -> str:
 
 @mcp.tool()
 def delete_record(collection: str, record_id: str) -> str:
-    """Soft delete a record. Master only."""
-    ctx = require_master()
+    """Soft delete a record."""
+    ctx = get_current_user()
+    if ctx is None:
+        return "Not authenticated. Call register_user first."
+    if err := _check_perm(ctx, "can_delete_record"):
+        return err
     actual = _resolve(collection, ctx)
     if not actual:
         return f"Invalid collection '{collection}'."
