@@ -185,6 +185,22 @@ def toggle_todo(title: str) -> str:
     return f"Todo '{title}' not found."
 
 
+@mcp.tool()
+def delete_todo(title: str) -> str:
+    """Delete a todo item from the list."""
+    ctx = get_current_user()
+    if ctx is None:
+        return "Not authenticated. Call register_user first."
+    if err := _check_perm(ctx, "can_toggle_todo"):
+        return err
+    todos = _get_collections(ctx).get("todos", [])
+    for i, todo in enumerate(todos):
+        if todo["title"] == title:
+            todos.pop(i)
+            return f"Todo '{title}' deleted."
+    return f"Todo '{title}' not found."
+
+
 # ---------------------------------------------------------------------------
 # Guest tools
 # ---------------------------------------------------------------------------

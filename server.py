@@ -621,6 +621,27 @@ async def toggle_todo(title: str) -> str:
     return f"Todo '{title}' marked as {status_text}."
 
 
+@mcp.tool()
+async def delete_todo(title: str) -> str:
+    """Delete a todo item from the list."""
+    ctx = await _get_auth_ctx()
+    if ctx.role == "family":
+        master_doc = await users_collection.find_one({"user_id": ctx.master_user_id})
+        member = next((m for m in master_doc.get("family_members", []) if m["email"] == ctx.email), None)
+        if member and not member.get("permissions", {}).get("can_toggle_todo", True):
+            return "Permission denied: can_toggle_todo is disabled for your account."
+    if db is None:
+        return "Error: MongoDB not configured."
+    coll = db[_prefixed("todos", ctx)]
+    result = await coll.delete_one({"title": title})
+    if result.deleted_count == 0:
+        available = await coll.distinct("title")
+        if available:
+            return f"Todo '{title}' not found. Available: {', '.join(available)}"
+        return f"Todo '{title}' not found. The todo list is empty."
+    return f"Todo '{title}' deleted."
+
+
 # ---------------------------------------------------------------------------
 # Guest tools
 # ---------------------------------------------------------------------------
