@@ -1,7 +1,10 @@
 import asyncio
 import sys
 
-from mcp_server.main import mcp
+try:
+    from mcp_server.main import mcp
+except ImportError:
+    from .main import mcp
 
 
 def main() -> None:

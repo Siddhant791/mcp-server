@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 from mcp.server.mcpserver.server import MCPServer
 
 from auth.middleware import get_current_user, require_master
-from auth.models import AuthContext, FamilyMember, FAMILY_DEFAULT_PERMISSIONS, generate_user_id
+from auth.models import AuthContext, FamilyMember, FAMILY_DEFAULT_PERMISSIONS, CollectionMetadata, generate_user_id
 
 mcp = MCPServer(name="wedding-mcp-server")
 
 _users: dict[str, dict] = {}
 _user_collections: dict[str, dict[str, list[dict]]] = {}
 _user_schemas: dict[str, dict[str, dict]] = {}
+_user_collection_metadata: dict[str, list[dict]] = {}  # master_user_id -> list of metadata dicts
 
 # Track master users whose family members have been migrated to new defaults
 _migrated_masters: set[str] = set()
@@ -63,6 +64,61 @@ def _check_perm(ctx: AuthContext, perm: str) -> str | None:
                 return f"Permission denied: {perm} is disabled."
             return None
     return None
+
+
+# ---------------------------------------------------------------------------
+# Collection metadata helpers (in-memory)
+# ---------------------------------------------------------------------------
+def _save_collection_metadata(metadata: CollectionMetadata) -> None:
+    """Save or update collection metadata for a user."""
+    user_id = metadata.user_id
+    meta_list = _user_collection_metadata.setdefault(user_id, [])
+    for i, existing in enumerate(meta_list):
+        if existing["collection_name"] == metadata.collection_name:
+            meta_list[i] = metadata.to_dict()
+            return
+    meta_list.append(metadata.to_dict())
+
+
+def _get_all_user_metadata(user_id: str) -> list[CollectionMetadata]:
+    """Get all collection metadata for a user."""
+    return [
+        CollectionMetadata.from_dict(m)
+        for m in _user_collection_metadata.get(user_id, [])
+    ]
+
+
+def _search_collection_metadata(user_id: str, query: str) -> list[dict]:
+    """Search collection metadata by text matching against name, description, and categories."""
+    all_metadata = _get_all_user_metadata(user_id)
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+
+    scored_results = []
+    for meta in all_metadata:
+        score = 0
+        searchable = f"{meta.collection_name} {meta.description} {meta.searchable_text} {' '.join(meta.categories)}".lower()
+
+        for word in query_words:
+            if word in meta.collection_name.lower():
+                score += 3
+            if word in meta.description.lower():
+                score += 2
+            if word in " ".join(meta.categories).lower():
+                score += 1
+            if word in searchable:
+                score += 1
+
+        if score > 0:
+            scored_results.append({
+                "collection_name": meta.collection_name,
+                "description": meta.description,
+                "score": score,
+                "metadata_status": meta.metadata_status,
+            })
+
+    scored_results.sort(key=lambda x: x["score"], reverse=True)
+    return scored_results
 
 
 # ---------------------------------------------------------------------------
@@ -379,8 +435,11 @@ def get_gifts(collection: str, guest_name: str = "") -> list[dict]:
 # Dynamic collection tools
 # ---------------------------------------------------------------------------
 @mcp.tool()
-def create_collection(name: str, fields: dict = {}) -> str:
-    """Create a new collection."""
+def create_collection(name: str, description: str = "", fields: dict = {}) -> str:
+    """Create a new collection. A description is required for semantic discovery.
+
+    If you provide only a collection name without a description, the server will ask for clarification about what the collection stores.
+    """
     ctx = get_current_user()
     if ctx is None:
         return "Not authenticated. Call register_user first."
@@ -389,13 +448,66 @@ def create_collection(name: str, fields: dict = {}) -> str:
     clean = name.strip()
     if not clean:
         return "Collection name cannot be empty."
+
+    desc_clean = description.strip() if description else ""
+    if not desc_clean:
+        import json
+        return json.dumps({
+            "status": "NEEDS_CLARIFICATION",
+            "collectionName": clean,
+            "message": "A description is required so this collection can be discovered later.",
+            "question": f"What kind of information will you store in the '{clean}' collection?",
+        })
+
     colls = _get_collections(ctx)
     if clean in set(VALID_GUEST_COLLECTIONS.values()) | set(colls.keys()):
         return f"Collection '{clean}' already exists."
+
     colls[clean] = []
     _user_schemas.setdefault(ctx.master_user_id, {})[clean] = fields
+
+    metadata = CollectionMetadata.generate_from_description(ctx.master_user_id, clean, desc_clean)
+    _save_collection_metadata(metadata)
+
     field_list = ", ".join(fields.keys()) if fields else "none"
     return f"Collection '{clean}' created with fields: {field_list}."
+
+
+@mcp.tool()
+def discover_collections(query: str) -> str:
+    """Discover which collections are relevant to a natural-language query. Use this before querying collections when the user asks a broad semantic question like 'Give me my wedding expenses'.
+
+    This tool searches your collection metadata to find which collections match the query. It returns collection names and descriptions so you can then query those collections using get_records or manage_collection.
+
+    Example: discover_collections('wedding expenses') might return collections like 'expense', 'roka', 'wedding_venue'.
+    """
+    ctx = get_current_user()
+    if ctx is None:
+        return "Not authenticated. Call register_user first."
+
+    results = _search_collection_metadata(ctx.master_user_id, query)
+    if not results:
+        import json
+        return json.dumps({
+            "status": "NOT_FOUND",
+            "query": query,
+            "message": "No relevant collections found for this query.",
+            "collections": [],
+        })
+
+    import json
+    return json.dumps({
+        "status": "FOUND",
+        "query": query,
+        "collections": [
+            {
+                "collectionName": r["collection_name"],
+                "description": r["description"],
+                "reason": f"Contains data related to: {r['description']}",
+            }
+            for r in results
+        ],
+    })
 
 
 @mcp.tool()
@@ -421,7 +533,14 @@ def add_record(collection: str, data: dict) -> str:
 
 @mcp.tool()
 def get_records(collection: str, filters: dict = {}) -> list[dict]:
-    """Get records with optional filters."""
+    """Get records from a specific collection. This tool requires an actual collection name, NOT a natural-language concept.
+
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call get_records on each discovered collection
+    3. Combine the results
+
+    Use this tool when you already know the exact collection name (e.g., 'expense', 'roka')."""
     ctx = get_current_user()
     if ctx is None:
         return [{"error": "Not authenticated."}]
@@ -512,7 +631,12 @@ def manage_collection(
     record_id: str = "",
     updates: dict = {},
 ) -> list[dict] | str:
-    """Manage records in a user-specific collection.
+    """Manage records in a user-specific collection. This tool requires an actual collection name, NOT a natural-language concept.
+
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call manage_collection or get_records on each discovered collection
+    3. Combine the results
 
     Supported operations:
       - get:     Retrieve records. Use 'filters' to narrow results (e.g. {"status": "active"}).

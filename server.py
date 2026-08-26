@@ -13,7 +13,7 @@ from starlette.routing import Route
 from mcp.server.mcpserver.server import MCPServer
 
 from auth.middleware import AuthMiddleware, get_current_user, require_auth, require_master
-from auth.models import AuthContext, FamilyMember, FAMILY_DEFAULT_PERMISSIONS, generate_user_id
+from auth.models import AuthContext, FamilyMember, FAMILY_DEFAULT_PERMISSIONS, CollectionMetadata, generate_user_id
 from auth.oauth import (
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
@@ -124,6 +124,80 @@ async def _load_user_schemas(ctx: AuthContext) -> None:
         schemas[name] = doc.get("fields", {})
     _user_dynamic_collections[key] = dynamic
     _user_schemas[key] = schemas
+
+
+# ---------------------------------------------------------------------------
+# Collection metadata repository
+# ---------------------------------------------------------------------------
+METADATA_COLLECTION = "_mcp_collection_metadata"
+
+
+async def _save_collection_metadata(metadata: CollectionMetadata) -> None:
+    """Save or update collection metadata for a user."""
+    if db is None:
+        return
+    coll = db[METADATA_COLLECTION]
+    metadata.updated_at = datetime.now(timezone.utc)
+    await coll.update_one(
+        {"user_id": metadata.user_id, "collection_name": metadata.collection_name},
+        {"$set": metadata.to_dict()},
+        upsert=True,
+    )
+
+
+async def _get_collection_metadata(user_id: str, collection_name: str) -> CollectionMetadata | None:
+    """Get metadata for a specific collection."""
+    if db is None:
+        return None
+    coll = db[METADATA_COLLECTION]
+    doc = await coll.find_one({"user_id": user_id, "collection_name": collection_name})
+    if doc:
+        return CollectionMetadata.from_dict(doc)
+    return None
+
+
+async def _get_all_user_metadata(user_id: str) -> list[CollectionMetadata]:
+    """Get all collection metadata for a user."""
+    if db is None:
+        return []
+    coll = db[METADATA_COLLECTION]
+    results = []
+    async for doc in coll.find({"user_id": user_id}):
+        results.append(CollectionMetadata.from_dict(doc))
+    return results
+
+
+async def _search_collection_metadata(user_id: str, query: str) -> list[dict]:
+    """Search collection metadata by text matching against name, description, and categories."""
+    all_metadata = await _get_all_user_metadata(user_id)
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+
+    scored_results = []
+    for meta in all_metadata:
+        score = 0
+        searchable = f"{meta.collection_name} {meta.description} {meta.searchable_text} {' '.join(meta.categories)}".lower()
+
+        for word in query_words:
+            if word in meta.collection_name.lower():
+                score += 3
+            if word in meta.description.lower():
+                score += 2
+            if word in " ".join(meta.categories).lower():
+                score += 1
+            if word in searchable:
+                score += 1
+
+        if score > 0:
+            scored_results.append({
+                "collection_name": meta.collection_name,
+                "description": meta.description,
+                "score": score,
+                "metadata_status": meta.metadata_status,
+            })
+
+    scored_results.sort(key=lambda x: x["score"], reverse=True)
+    return scored_results
 
 
 async def _resolve(collection: str, ctx: AuthContext) -> str | None:
@@ -896,8 +970,11 @@ async def get_gifts(collection: str, guest_name: str = "") -> list[dict]:
 # Dynamic collection tools
 # ---------------------------------------------------------------------------
 @mcp.tool()
-async def create_collection(name: str, fields: dict = {}) -> str:
-    """Create a new collection with a defined schema. After creation use add_record, get_records, update_record, delete_record."""
+async def create_collection(name: str, description: str = "", fields: dict = {}) -> str:
+    """Create a new collection with a defined schema. A description is required for semantic discovery. After creation use add_record, get_records, update_record, delete_record.
+
+    If you provide only a collection name without a description, the server will ask for clarification about what the collection stores.
+    """
     ctx = await _get_auth_ctx()
     if perm_err := await _check_family_perm(ctx, "can_create_collection"):
         return perm_err
@@ -907,9 +984,21 @@ async def create_collection(name: str, fields: dict = {}) -> str:
     clean = name.strip()
     if not clean:
         return "Collection name cannot be empty."
+
+    desc_clean = description.strip() if description else ""
+    if not desc_clean:
+        import json
+        return json.dumps({
+            "status": "NEEDS_CLARIFICATION",
+            "collectionName": clean,
+            "message": "A description is required so this collection can be discovered later.",
+            "question": f"What kind of information will you store in the '{clean}' collection?",
+        })
+
     all_known = set(VALID_GUEST_COLLECTIONS.values()) | _user_dynamic_collections.get(ctx.master_user_id, set())
     if clean in all_known:
         return f"Collection '{clean}' already exists."
+
     full_name = _prefixed(clean, ctx)
     coll = db[full_name]
     await coll.insert_one({"_init": True})
@@ -918,8 +1007,49 @@ async def create_collection(name: str, fields: dict = {}) -> str:
     await schemas_coll.insert_one({"name": clean, "fields": fields})
     _user_dynamic_collections.setdefault(ctx.master_user_id, set()).add(clean)
     _user_schemas.setdefault(ctx.master_user_id, {})[clean] = fields
+
+    metadata = CollectionMetadata.generate_from_description(ctx.master_user_id, clean, desc_clean)
+    await _save_collection_metadata(metadata)
+
     field_list = ", ".join(fields.keys()) if fields else "none"
     return f"Collection '{clean}' created with fields: {field_list}."
+
+
+@mcp.tool()
+async def discover_collections(query: str) -> list[dict] | str:
+    """Discover which collections are relevant to a natural-language query. Use this before querying collections when the user asks a broad semantic question like 'Give me my wedding expenses'.
+
+    This tool searches your collection metadata to find which collections match the query. It returns collection names and descriptions so you can then query those collections using get_records or manage_collection.
+
+    Example: discover_collections('wedding expenses') might return collections like 'expense', 'roka', 'wedding_venue'.
+    """
+    ctx = await _get_auth_ctx()
+    if db is None:
+        return "Error: MongoDB not configured."
+
+    results = await _search_collection_metadata(ctx.master_user_id, query)
+    if not results:
+        import json
+        return json.dumps({
+            "status": "NOT_FOUND",
+            "query": query,
+            "message": "No relevant collections found for this query.",
+            "collections": [],
+        })
+
+    import json
+    return json.dumps({
+        "status": "FOUND",
+        "query": query,
+        "collections": [
+            {
+                "collectionName": r["collection_name"],
+                "description": r["description"],
+                "reason": f"Contains data related to: {r['description']}",
+            }
+            for r in results
+        ],
+    })
 
 
 @mcp.tool()
@@ -947,7 +1077,14 @@ async def add_record(collection: str, data: dict) -> str:
 
 @mcp.tool()
 async def get_records(collection: str, filters: dict = {}) -> list[dict]:
-    """Get records from any collection with optional filters."""
+    """Get records from a specific MongoDB collection. This tool requires an actual collection name, NOT a natural-language concept.
+
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call get_records on each discovered collection
+    3. Combine the results
+
+    Use this tool when you already know the exact collection name (e.g., 'expense', 'roka')."""
     ctx = await _get_auth_ctx()
     if db is None:
         return [{"error": "MongoDB not configured."}]
@@ -1060,7 +1197,12 @@ async def manage_collection(
     record_id: str = "",
     updates: dict = {},
 ) -> list[dict] | str:
-    """Manage records in a user-specific collection.
+    """Manage records in a user-specific collection. This tool requires an actual MongoDB collection name, NOT a natural-language concept.
+
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call manage_collection or get_records on each discovered collection
+    3. Combine the results
 
     Supported operations:
       - get:     Retrieve records. Use 'filters' to narrow results (e.g. {"status": "active"}).
