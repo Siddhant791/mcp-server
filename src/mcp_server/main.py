@@ -475,11 +475,12 @@ def create_collection(name: str, description: str = "", fields: dict = {}) -> st
 
 @mcp.tool()
 def discover_collections(query: str) -> str:
-    """Find which user collections contain data relevant to a query. ALWAYS call this first before answering any data question.
+    """Discover which collections are relevant to a natural-language query. Use this before querying collections when the user asks a broad semantic question like 'Give me my wedding expenses'.
 
-    For broad questions like 'total wedding expenses' or 'show me all my data', call this MULTIPLE TIMES with different keywords (e.g. 'expense', 'roka', 'vendor', 'cost', 'payment') to find ALL relevant collections. Then query each one and combine results.
+    This tool searches your collection metadata to find which collections match the query. It returns collection names and descriptions so you can then query those collections using get_records or manage_collection.
 
-    Returns a list of matching collections with names and descriptions."""
+    Example: discover_collections('wedding expenses') might return collections like 'expense', 'roka', 'wedding_venue'.
+    """
     ctx = get_current_user()
     if ctx is None:
         return "Not authenticated. Call register_user first."
@@ -532,9 +533,14 @@ def add_record(collection: str, data: dict) -> str:
 
 @mcp.tool()
 def get_records(collection: str, filters: dict = {}) -> list[dict]:
-    """Get all records from a collection by its exact name. Requires the actual collection name, not a natural-language concept.
+    """Get records from a specific collection. This tool requires an actual collection name, NOT a natural-language concept.
 
-    For any broad question (totals, summaries, lists of data), you must first call discover_collections with multiple queries to find ALL relevant collections, then call get_records on EACH one and combine the results. Never assume a single collection has all the data."""
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call get_records on each discovered collection
+    3. Combine the results
+
+    Use this tool when you already know the exact collection name (e.g., 'expense', 'roka')."""
     ctx = get_current_user()
     if ctx is None:
         return [{"error": "Not authenticated."}]
@@ -625,7 +631,19 @@ def manage_collection(
     record_id: str = "",
     updates: dict = {},
 ) -> list[dict] | str:
-    """Manage records in a collection. Operations: 'get' (retrieve records with filters) or 'update' (modify a record by record_id). Requires an exact collection name."""
+    """Manage records in a user-specific collection. This tool requires an actual collection name, NOT a natural-language concept.
+
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call manage_collection or get_records on each discovered collection
+    3. Combine the results
+
+    Supported operations:
+      - get:     Retrieve records. Use 'filters' to narrow results (e.g. {"status": "active"}).
+      - update:  Update a record. Provide 'record_id' and 'updates' dict (e.g. {"status": "done"}).
+
+    Collections are user-scoped — you can only access your own collections.
+    """
     ctx = get_current_user()
     if ctx is None:
         return "Not authenticated. Call register_user first."
