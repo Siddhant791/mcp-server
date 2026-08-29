@@ -1156,9 +1156,14 @@ async def add_record(collection: str, data: dict) -> str:
 
 @mcp.tool()
 async def get_records(collection: str, filters: dict = {}) -> list[dict]:
-    """Get all records from a collection by its exact name. Requires the actual MongoDB collection name, not a natural-language concept.
+    """Get records from a specific MongoDB collection. This tool requires an actual collection name, NOT a natural-language concept.
 
-    For any broad question (totals, summaries, lists of data), you must first call discover_collections with multiple queries to find ALL relevant collections, then call get_records on EACH one and combine the results. Never assume a single collection has all the data.
+    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
+    1. First call discover_collections('wedding expenses') to find relevant collections
+    2. Then call get_records on each discovered collection
+    3. Combine the results
+
+    Use this tool when you already know the exact collection name (e.g., 'expense', 'roka')."""
     ctx = await _get_auth_ctx()
     if db is None:
         return [{"error": "MongoDB not configured."}]
