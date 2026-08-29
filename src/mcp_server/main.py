@@ -109,6 +109,12 @@ def _search_collection_metadata(user_id: str, query: str) -> list[dict]:
             if word in searchable:
                 score += 1
 
+        # Substring match: entire query appears in name or description
+        if query_lower in meta.collection_name.lower():
+            score += 5
+        if query_lower in meta.description.lower():
+            score += 3
+
         if score > 0:
             scored_results.append({
                 "collection_name": meta.collection_name,
@@ -475,19 +481,79 @@ def create_collection(name: str, description: str = "", fields: dict = {}) -> st
 
 @mcp.tool()
 def discover_collections(query: str) -> str:
-    """Discover which collections are relevant to a natural-language query. Use this before querying collections when the user asks a broad semantic question like 'Give me my wedding expenses'.
+    """Find which user collections contain data relevant to a query. ALWAYS call this first before answering any data question.
 
-    This tool searches your collection metadata to find which collections match the query. It returns collection names and descriptions so you can then query those collections using get_records or manage_collection.
+    For broad questions like 'total wedding expenses' or 'show me all my data', call this MULTIPLE TIMES with different keywords (e.g. 'expense', 'roka', 'vendor', 'cost', 'payment') to find ALL relevant collections. Then query each one and combine results.
 
-    Example: discover_collections('wedding expenses') might return collections like 'expense', 'roka', 'wedding_venue'.
-    """
+    Returns a list of matching collections with names and descriptions."""
     ctx = get_current_user()
     if ctx is None:
         return "Not authenticated. Call register_user first."
 
+    # 1. Search metadata
     results = _search_collection_metadata(ctx.master_user_id, query)
+
+    # 2. Also list ALL user collections and do fuzzy name matching
+    all_collections = _get_collections(ctx).keys()
+    query_lower = query.lower()
+    query_words = set(query_lower.split())
+
+    seen = {r["collection_name"] for r in results}
+    for coll_name in sorted(all_collections):
+        if coll_name in seen:
+            continue
+        name_lower = coll_name.lower()
+        score = 0
+        for word in query_words:
+            if word in name_lower:
+                score += 3
+        if query_lower in name_lower:
+            score += 5
+        for part in name_lower.replace("-", "_").split("_"):
+            for word in query_words:
+                if part.startswith(word) or word.startswith(part):
+                    score += 2
+        if score > 0:
+            results.append({
+                "collection_name": coll_name,
+                "description": f"(no description) Collection: {coll_name}",
+                "score": score,
+                "metadata_status": "no_metadata",
+            })
+            seen.add(coll_name)
+
+    # 3. Also include fixed/virtual collections that match
+    fixed = {
+        "guests_engagement": "Engagement guest list",
+        "guests_marriage": "Marriage guest list",
+        "roka": "Roka ceremony records",
+        "todo": "Todo items",
+        "family": "Family members",
+        "shagun": "Shagun/gift records",
+    }
+    for coll_name, desc in fixed.items():
+        if coll_name in seen:
+            continue
+        name_lower = coll_name.lower()
+        score = 0
+        for word in query_words:
+            if word in name_lower or word in desc.lower():
+                score += 2
+        if query_lower in name_lower or query_lower in desc.lower():
+            score += 4
+        if score > 0:
+            results.append({
+                "collection_name": coll_name,
+                "description": desc,
+                "score": score,
+                "metadata_status": "fixed",
+            })
+            seen.add(coll_name)
+
+    results.sort(key=lambda x: x.get("score", 0), reverse=True)
+
+    import json
     if not results:
-        import json
         return json.dumps({
             "status": "NOT_FOUND",
             "query": query,
@@ -495,7 +561,6 @@ def discover_collections(query: str) -> str:
             "collections": [],
         })
 
-    import json
     return json.dumps({
         "status": "FOUND",
         "query": query,
