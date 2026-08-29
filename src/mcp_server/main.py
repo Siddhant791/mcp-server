@@ -436,9 +436,16 @@ def get_gifts(collection: str, guest_name: str = "") -> list[dict]:
 # ---------------------------------------------------------------------------
 @mcp.tool()
 def create_collection(name: str, description: str = "", fields: dict = {}) -> str:
-    """Create a new collection. A description is required for semantic discovery.
+    """Create a new collection in the system.
 
-    If you provide only a collection name without a description, the server will ask for clarification about what the collection stores.
+    Parameters:
+    - name: The collection name (e.g. "vendors", "expenses", "roka_items")
+    - description: A short sentence describing what this collection stores. Example: "Vendor quotations, market prices, and contact details"
+    - fields: Optional schema fields as a dict. Example: {"name": "string", "price": "number"}
+
+    The description is required. It helps the system discover this collection when users ask questions like "show me my vendor data". If the user's intent is clear from context, you should infer the description yourself and pass it directly. Only ask the user for a description if the purpose is completely unclear.
+
+    Example call: create_collection(name="vendors", description="Vendor quotations, market prices, and contact details", fields={"name": "string", "price": "number", "number": "string", "comments": "string"})
     """
     ctx = get_current_user()
     if ctx is None:
@@ -455,8 +462,8 @@ def create_collection(name: str, description: str = "", fields: dict = {}) -> st
         return json.dumps({
             "status": "NEEDS_CLARIFICATION",
             "collectionName": clean,
-            "message": "A description is required so this collection can be discovered later.",
-            "question": f"What kind of information will you store in the '{clean}' collection?",
+            "message": "A description is required. Please re-call this tool with a description parameter describing what the collection stores.",
+            "question": f"What kind of information will you store in the '{clean}' collection? Re-call create_collection with the description parameter filled in.",
         })
 
     colls = _get_collections(ctx)
