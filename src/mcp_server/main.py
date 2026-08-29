@@ -80,6 +80,14 @@ def _save_collection_metadata(metadata: CollectionMetadata) -> None:
     meta_list.append(metadata.to_dict())
 
 
+def _get_collection_metadata(user_id: str, collection_name: str) -> CollectionMetadata | None:
+    """Get metadata for a specific collection of a user."""
+    for m in _user_collection_metadata.get(user_id, []):
+        if m["collection_name"] == collection_name:
+            return CollectionMetadata.from_dict(m)
+    return None
+
+
 def _get_all_user_metadata(user_id: str) -> list[CollectionMetadata]:
     """Get all collection metadata for a user."""
     return [
@@ -472,7 +480,7 @@ def create_collection(name: str, description: str = "", fields: dict = {}) -> st
     colls[clean] = []
     _user_schemas.setdefault(ctx.master_user_id, {})[clean] = fields
 
-    metadata = CollectionMetadata.generate_from_description(ctx.master_user_id, clean, desc_clean)
+    metadata = CollectionMetadata.generate_from_description(ctx.master_user_id, clean, desc_clean, fields if fields else None)
     _save_collection_metadata(metadata)
 
     field_list = ", ".join(fields.keys()) if fields else "none"
@@ -575,9 +583,209 @@ def discover_collections(query: str) -> str:
     })
 
 
+# ---------------------------------------------------------------------------
+# list_user_collections — returns ALL authorized collections with rich metadata
+# ---------------------------------------------------------------------------
+
+def _backfill_metadata_for_collection(ctx, coll_name: str) -> dict | None:
+    """Generate and save metadata for a collection that has none."""
+    meta = _get_collection_metadata(ctx.master_user_id, coll_name)
+    if meta:
+        return meta.to_dict()
+
+    # Try to infer from the collection's actual documents
+    actual = _resolve(coll_name, ctx)
+    if not actual:
+        return None
+    colls = _get_collections(ctx)
+    records = colls.get(actual, [])
+    schema = {}
+    if records:
+        sample = records[0]
+        for k, v in sample.items():
+            if k.startswith("_") or k == "deleted":
+                continue
+            if isinstance(v, (int, float)):
+                schema[k] = "number"
+            elif isinstance(v, str):
+                schema[k] = "string"
+            elif isinstance(v, bool):
+                schema[k] = "boolean"
+            elif isinstance(v, list):
+                schema[k] = "array"
+
+    stored_schema = _user_schemas.get(ctx.master_user_id, {}).get(coll_name, {})
+    if stored_schema:
+        schema = stored_schema
+
+    description = f"Collection: {coll_name}"
+    new_meta = CollectionMetadata.generate_from_description(
+        ctx.master_user_id, coll_name, description, schema if schema else None
+    )
+    _save_collection_metadata(new_meta)
+    return new_meta.to_dict()
+
+
+@mcp.tool()
+def list_user_collections() -> str:
+    """List ALL collections belonging to the currently authenticated user with rich metadata.
+
+    Returns every collection the user owns or has access to, including:
+    - Collection name and description
+    - Domain (wedding, travel, home, etc.)
+    - Whether it contains expense/financial data
+    - Which fields store monetary amounts
+    - Which fields store dates
+
+    ALWAYS call this first for broad questions like 'total expenses', 'all my data', 'wedding summary'.
+    The server validates authorization — only your own collections are returned.
+    """
+    ctx = get_current_user()
+    if ctx is None:
+        import json
+        return json.dumps({"error": "Not authenticated."})
+
+    collections_info = []
+
+    # Fixed/virtual collections
+    fixed_collections = {
+        "guests_engagement": "Engagement guest list — tracks attendees for the engagement ceremony",
+        "guests_marriage": "Marriage guest list — tracks attendees for the wedding ceremony",
+        "roka": "Roka ceremony records — expenses, guests, and details for the roka function",
+        "todo": "Todo items — tasks and reminders for wedding/event planning",
+        "family": "Family members — information about family members involved in the events",
+        "shagun": "Shagun and gift records — monetary gifts received or given",
+    }
+    for coll_name, desc in fixed_collections.items():
+        meta_dict = _backfill_metadata_for_collection(ctx, coll_name)
+        collections_info.append({
+            "name": coll_name,
+            "description": desc,
+            "domain": meta_dict.get("domain", "") if meta_dict else "",
+            "containsExpenses": meta_dict.get("contains_expenses", False) if meta_dict else False,
+            "amountFields": meta_dict.get("amount_fields", []) if meta_dict else [],
+            "dateFields": meta_dict.get("date_fields", []) if meta_dict else [],
+        })
+
+    # Dynamic (user-created) collections
+    all_collections = _get_collections(ctx).keys()
+    for coll_name in sorted(all_collections):
+        if coll_name.startswith("usr_"):
+            continue
+        meta_dict = _backfill_metadata_for_collection(ctx, coll_name)
+        desc = meta_dict.get("description", f"Collection: {coll_name}") if meta_dict else f"Collection: {coll_name}"
+        collections_info.append({
+            "name": coll_name,
+            "description": desc,
+            "domain": meta_dict.get("domain", "") if meta_dict else "",
+            "containsExpenses": meta_dict.get("contains_expenses", False) if meta_dict else False,
+            "amountFields": meta_dict.get("amount_fields", []) if meta_dict else [],
+            "dateFields": meta_dict.get("date_fields", []) if meta_dict else [],
+        })
+
+    import json
+    return json.dumps({
+        "userId": ctx.master_user_id,
+        "totalCollections": len(collections_info),
+        "collections": collections_info,
+    })
+
+
+# ---------------------------------------------------------------------------
+# aggregate_user_collection — sum/count on authorized collections
+# ---------------------------------------------------------------------------
+
+def _is_numeric(val) -> bool:
+    return isinstance(val, (int, float)) and not isinstance(val, bool)
+
+
+@mcp.tool()
+def aggregate_user_collection(
+    collections: list[str] = [],
+    operation: str = "sum",
+    field: str = "",
+) -> str:
+    """Aggregate data across one or more authorized collections. Use for totals, counts, and summaries.
+
+    operations:
+      - "sum": Total of a numeric field across all records in the given collections.
+      - "count": Count of records in the given collections.
+
+    If collections is empty, aggregates across ALL user collections that contain expense data.
+    The server validates that each collection belongs to the authenticated user before querying.
+    """
+    ctx = get_current_user()
+    if ctx is None:
+        import json
+        return json.dumps({"error": "Not authenticated."})
+
+    # If no collections specified, find all expense-related collections
+    if not collections:
+        all_meta = _get_all_user_metadata(ctx.master_user_id)
+        collections = [m.collection_name for m in all_meta if m.contains_expenses]
+        fixed_expense = ["roka", "shagun", "guests_engagement", "guests_marriage"]
+        for fc in fixed_expense:
+            if fc not in collections:
+                collections.append(fc)
+
+    results = {}
+    grand_total = 0
+    total_count = 0
+
+    for coll_name in collections:
+        actual = _resolve(coll_name, ctx)
+        if not actual:
+            results[coll_name] = {"error": f"Collection '{coll_name}' not found or not authorized."}
+            continue
+
+        colls = _get_collections(ctx)
+        records = [r for r in colls.get(actual, []) if not r.get("deleted", False)]
+
+        if operation == "count":
+            results[coll_name] = {"count": len(records)}
+            total_count += len(records)
+
+        elif operation == "sum":
+            if not field:
+                meta = _get_collection_metadata(ctx.master_user_id, coll_name)
+                amount_fields = meta.amount_fields if meta else []
+                if amount_fields:
+                    field = amount_fields[0]
+                else:
+                    field = "amount"
+
+            total = 0
+            found_field = False
+            for rec in records:
+                val = rec.get(field)
+                if _is_numeric(val):
+                    total += val
+                    found_field = True
+            results[coll_name] = {
+                "sum": total,
+                "field": field,
+                "recordCount": len(records),
+                "fieldFound": found_field,
+            }
+            grand_total += total
+
+        else:
+            import json
+            return json.dumps({"error": f"Unknown operation '{operation}'. Use 'sum' or 'count'."})
+
+    import json
+    response = {"operation": operation, "collections": results}
+    if operation == "sum":
+        response["grandTotal"] = grand_total
+    elif operation == "count":
+        response["totalCount"] = total_count
+
+    return json.dumps(response)
+
+
 @mcp.tool()
 def add_record(collection: str, data: dict) -> str:
-    """Add a record to any collection."""
+    """Add a new record to an authorized collection. The server validates that the collection belongs to the authenticated user before writing."""
     ctx = get_current_user()
     if ctx is None:
         return "Not authenticated."
@@ -598,14 +806,9 @@ def add_record(collection: str, data: dict) -> str:
 
 @mcp.tool()
 def get_records(collection: str, filters: dict = {}) -> list[dict]:
-    """Get records from a specific collection. This tool requires an actual collection name, NOT a natural-language concept.
+    """Get records from an authorized collection by its exact name. The server validates ownership before querying.
 
-    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
-    1. First call discover_collections('wedding expenses') to find relevant collections
-    2. Then call get_records on each discovered collection
-    3. Combine the results
-
-    Use this tool when you already know the exact collection name (e.g., 'expense', 'roka')."""
+    For broad questions (totals, summaries), first call list_user_collections to see all available collections, then query each relevant one. Never assume a single collection has all the data."""
     ctx = get_current_user()
     if ctx is None:
         return [{"error": "Not authenticated."}]
@@ -696,19 +899,7 @@ def manage_collection(
     record_id: str = "",
     updates: dict = {},
 ) -> list[dict] | str:
-    """Manage records in a user-specific collection. This tool requires an actual collection name, NOT a natural-language concept.
-
-    IMPORTANT: If the user asks a broad semantic question like 'Give me my wedding expenses', do NOT guess a collection name. Instead:
-    1. First call discover_collections('wedding expenses') to find relevant collections
-    2. Then call manage_collection or get_records on each discovered collection
-    3. Combine the results
-
-    Supported operations:
-      - get:     Retrieve records. Use 'filters' to narrow results (e.g. {"status": "active"}).
-      - update:  Update a record. Provide 'record_id' and 'updates' dict (e.g. {"status": "done"}).
-
-    Collections are user-scoped — you can only access your own collections.
-    """
+    """Manage records in an authorized collection. Operations: 'get' (retrieve with filters) or 'update' (modify by record_id). Server validates ownership before accessing data."""
     ctx = get_current_user()
     if ctx is None:
         return "Not authenticated. Call register_user first."

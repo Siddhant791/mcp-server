@@ -90,6 +90,10 @@ class CollectionMetadata:
     searchable_text: str = ""
     categories: list[str] = field(default_factory=list)
     domain: str = ""
+    contains_expenses: bool = False
+    amount_fields: list[str] = field(default_factory=list)
+    date_fields: list[str] = field(default_factory=list)
+    searchable_fields: list[str] = field(default_factory=list)
     metadata_status: str = "COMPLETE"  # COMPLETE or NEEDS_DESCRIPTION
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -102,6 +106,10 @@ class CollectionMetadata:
             "searchable_text": self.searchable_text,
             "categories": self.categories,
             "domain": self.domain,
+            "contains_expenses": self.contains_expenses,
+            "amount_fields": self.amount_fields,
+            "date_fields": self.date_fields,
+            "searchable_fields": self.searchable_fields,
             "metadata_status": self.metadata_status,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
@@ -126,6 +134,10 @@ class CollectionMetadata:
             searchable_text=data.get("searchable_text", ""),
             categories=data.get("categories", []),
             domain=data.get("domain", ""),
+            contains_expenses=data.get("contains_expenses", False),
+            amount_fields=data.get("amount_fields", []),
+            date_fields=data.get("date_fields", []),
+            searchable_fields=data.get("searchable_fields", []),
             metadata_status=data.get("metadata_status", "COMPLETE"),
             created_at=created_at,
             updated_at=updated_at,
@@ -133,29 +145,82 @@ class CollectionMetadata:
 
     @staticmethod
     def generate_from_description(
-        user_id: str, collection_name: str, description: str
+        user_id: str, collection_name: str, description: str, schema: dict | None = None
     ) -> CollectionMetadata:
-        """Generate semantic metadata from a user-provided description."""
+        """Generate semantic metadata from a user-provided description and optional schema."""
         desc_lower = description.lower()
+        name_lower = collection_name.lower()
+        combined = f"{collection_name} {description}".lower()
         words = set()
         for word in desc_lower.split():
             cleaned = word.strip(".,;:!?\"'()-")
             if len(cleaned) > 2:
                 words.add(cleaned)
 
+        # Domain detection
         domain = ""
         domain_keywords = {
-            "wedding": ["wedding", "ceremony", "bride", "groom", "marriage", "reception"],
-            "finance": ["expense", "cost", "budget", "price", "payment", "money", "investment"],
-            "travel": ["travel", "trip", "flight", "hotel", "vacation", "honeymoon"],
-            "food": ["food", "catering", "menu", "meal", "restaurant"],
+            "wedding": ["wedding", "ceremony", "bride", "groom", "marriage", "reception", "roka", "sangeet", "mehndi"],
+            "finance": ["expense", "cost", "budget", "price", "payment", "money", "investment", "bill", "invoice"],
+            "travel": ["travel", "trip", "flight", "hotel", "vacation", "honeymoon", "booking"],
+            "food": ["food", "catering", "menu", "meal", "restaurant", "caterer"],
             "gift": ["gift", "shagun", "present", "return gift"],
-            "venue": ["venue", "hall", "place", "location"],
+            "venue": ["venue", "hall", "place", "location", "banquet"],
+            "decoration": ["decoration", "decor", "floral", "lighting", "setup"],
+            "photography": ["photography", "photo", "video", "album", "cinematography"],
+            "home": ["home", "furniture", "appliance", "renovation", "interior"],
         }
         for d, keywords in domain_keywords.items():
-            if any(kw in desc_lower for kw in keywords):
+            if any(kw in combined or kw in name_lower for kw in keywords):
                 domain = d
                 break
+
+        # Expense detection
+        expense_keywords = [
+            "expense", "cost", "price", "amount", "budget", "payment", "bill",
+            "total", "paid", "spend", "spent", "fee", "charge", "rate", "deposit",
+        ]
+        contains_expenses = any(kw in combined for kw in expense_keywords)
+
+        # Amount field detection from schema
+        amount_field_names = [
+            "price", "amount", "cost", "total", "expense", "budget", "payment",
+            "paid", "fee", "rate", "deposit", "value", "sum", "charge",
+            "flight", "food", "activities", "hotel", "venue_charge",
+        ]
+        date_field_names = [
+            "date", "created_at", "updated_at", "booking_date", "event_date",
+            "start_date", "end_date", "due_date", "payment_date",
+        ]
+        searchable_field_names = [
+            "name", "description", "title", "note", "vendor", "category",
+            "type", "status", "location", "comment", "detail",
+        ]
+
+        amount_fields = []
+        date_fields = []
+        searchable_fields = []
+
+        if schema:
+            for field_name in schema:
+                fn = field_name.lower()
+                if fn in amount_field_names or any(kw in fn for kw in ["price", "amount", "cost", "total", "expense", "budget", "payment"]):
+                    amount_fields.append(field_name)
+                    contains_expenses = True
+                if fn in date_field_names or any(kw in fn for kw in ["date", "time"]):
+                    date_fields.append(field_name)
+                if fn in searchable_field_names or any(kw in fn for kw in ["name", "desc", "title", "note", "vendor"]):
+                    searchable_fields.append(field_name)
+
+        # Infer amount fields from description if schema didn't provide any
+        if not amount_fields and contains_expenses:
+            amount_fields = ["amount"]
+            if "price" in combined:
+                amount_fields = ["price"]
+            elif "cost" in combined:
+                amount_fields = ["cost"]
+            elif "total" in combined:
+                amount_fields = ["total"]
 
         categories = [w for w in words if len(w) > 3][:10]
         searchable_text = f"{collection_name} {description}".lower()
@@ -167,5 +232,9 @@ class CollectionMetadata:
             searchable_text=searchable_text,
             categories=categories,
             domain=domain,
+            contains_expenses=contains_expenses,
+            amount_fields=amount_fields,
+            date_fields=date_fields,
+            searchable_fields=searchable_fields,
             metadata_status="COMPLETE",
         )
