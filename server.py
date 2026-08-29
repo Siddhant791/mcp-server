@@ -1207,10 +1207,6 @@ async def manage_collection(
 # ---------------------------------------------------------------------------
 mcp_app = mcp.streamable_http_app(host="0.0.0.0", stateless_http=True)
 
-# Health check for MCP session initialization
-async def _health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok"})
-
 # Add auth routes to the MCP Starlette app
 mcp_app.routes.insert(0, Route("/.well-known/oauth-authorization-server", _well_known, methods=["GET"]))
 mcp_app.routes.insert(1, Route("/.well-known/oauth-protected-resource", _protected_resource, methods=["GET"]))
@@ -1219,7 +1215,6 @@ mcp_app.routes.insert(3, Route("/authorize", _authorize, methods=["GET"]))
 mcp_app.routes.insert(4, Route("/auth/callback", _callback, methods=["GET"]))
 mcp_app.routes.insert(5, Route("/token", _token, methods=["POST"]))
 mcp_app.routes.insert(6, Route("/register", _register, methods=["POST"]))
-mcp_app.routes.insert(7, Route("/health", _health, methods=["GET"]))
 
 # Wrap with auth middleware
 app = AuthMiddleware(mcp_app)
