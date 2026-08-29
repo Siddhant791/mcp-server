@@ -349,7 +349,7 @@ async def _callback(request: Request):
     code = request.query_params.get("code")
     google_state = request.query_params.get("state")
 
-    print(f"[CALLBACK] code={code[:10] if code else 'None'}... state={google_state[:10] if google_state else 'None'}...", flush=True)
+    print(f"[CALLBACK] has_code={bool(code)} state_prefix={google_state[:8] if google_state else 'None'}", flush=True)
 
     if not code or not google_state:
         print("[CALLBACK] ERROR: Missing code or state", flush=True)
@@ -387,24 +387,30 @@ async def _callback(request: Request):
 
     server_code = secrets.token_urlsafe(32)
     code_challenge = stored_state.get("code_challenge", "")
+    code_challenge_method = stored_state.get("code_challenge_method", "S256")
+    client_id = stored_state.get("client_id", "")
+    resource = stored_state.get("resource", "")
     if db is not None:
         await db["_oauth_codes"].insert_one({
             "code": server_code,
             "jwt_token": jwt_token,
             "code_challenge": code_challenge,
+            "code_challenge_method": code_challenge_method,
+            "client_id": client_id,
+            "resource": resource,
             "created_at": datetime.now(timezone.utc),
         })
 
-    print(f"[CALLBACK] user={email} role={role} jwt_len={len(jwt_token)} server_code={server_code[:10]}...", flush=True)
+    print(f"[CALLBACK] user={email} role={role} server_code_prefix={server_code[:8]}", flush=True)
 
     if chatgpt_redirect:
         from urllib.parse import urlencode as _urlencode
         sep = "&" if "?" in chatgpt_redirect else "?"
-        params = {"code": server_code}
+        params = {"code": server_code, "iss": server_base}
         if chatgpt_state:
             params["state"] = chatgpt_state
         redirect_url = f"{chatgpt_redirect}{sep}{_urlencode(params)}"
-        print(f"[CALLBACK] REDIRECTING to ChatGPT: {redirect_url[:120]}...", flush=True)
+        print(f"[CALLBACK] redirect_uri_prefix={chatgpt_redirect[:60]}", flush=True)
         return RedirectResponse(redirect_url)
 
     print("[CALLBACK] NO chatgpt_redirect — returning HTML fallback", flush=True)
@@ -417,26 +423,23 @@ async def _register(request: Request) -> JSONResponse:
     body = await request.json()
     client_name = body.get("client_name", "mcp-client")
     client_id = "mcp_client_" + secrets.token_hex(8)
-    client_secret = secrets.token_hex(24)
     if db is not None:
         await db["_registered_clients"].insert_one({
             "client_id": client_id,
             "client_name": client_name,
-            "client_secret": client_secret,
             "redirect_uris": body.get("redirect_uris", []),
             "created_at": datetime.now(timezone.utc),
         })
     else:
         _registered_clients[client_id] = {
             "client_name": client_name,
-            "client_secret": client_secret,
             "redirect_uris": body.get("redirect_uris", []),
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
+    print(f"[REGISTER] client_id={client_id[:20]}... name={client_name}", flush=True)
     return JSONResponse({
         "client_id": client_id,
         "client_name": client_name,
-        "client_secret": client_secret,
         "redirect_uris": body.get("redirect_uris", []),
         "grant_types": ["authorization_code"],
         "response_types": ["code"],
@@ -457,20 +460,17 @@ async def _token(request: Request) -> JSONResponse:
         code = body.get("code", "")
         code_verifier = body.get("code_verifier", "")
         client_id = body.get("client_id", "")
-        print(f"[TOKEN] grant_type={grant_type} code={code[:10] if code else 'None'}... has_verifier={bool(code_verifier)} client_id={client_id[:40] if client_id else 'None'}... ct={content_type}", flush=True)
+        print(f"[TOKEN] grant_type={grant_type} has_code={bool(code)} has_verifier={bool(code_verifier)} ct={content_type}", flush=True)
 
         if grant_type != "authorization_code":
             return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
 
         auth_info = None
         if db is not None:
-            print(f"[TOKEN] Looking up code in _oauth_codes...", flush=True)
             auth_info = await db["_oauth_codes"].find_one_and_delete({"code": code})
-            print(f"[TOKEN] MongoDB lookup result: {'found' if auth_info else 'not found'}", flush=True)
-        else:
-            print("[TOKEN] db is None!", flush=True)
 
         if auth_info:
+            # --- Server-issued code (MCP OAuth flow) ---
             created_at = auth_info.get("created_at")
             if created_at:
                 if created_at.tzinfo is None:
@@ -481,33 +481,43 @@ async def _token(request: Request) -> JSONResponse:
                     return JSONResponse({"error": "invalid_grant", "detail": "Authorization code expired"}, status_code=400)
 
             stored_challenge = auth_info.get("code_challenge", "")
-            if stored_challenge and code_verifier:
+            stored_method = auth_info.get("code_challenge_method", "S256")
+            stored_client_id = auth_info.get("client_id", "")
+
+            # Require code_verifier when a code_challenge was stored
+            if stored_challenge:
+                if not code_verifier:
+                    print("[TOKEN] PKCE required but code_verifier missing", flush=True)
+                    return JSONResponse({"error": "invalid_grant", "detail": "code_verifier is required"}, status_code=400)
+
+                # Only S256 is supported
+                if stored_method and stored_method != "S256":
+                    print(f"[TOKEN] Unsupported code_challenge_method: {stored_method}", flush=True)
+                    return JSONResponse({"error": "invalid_grant", "detail": f"Unsupported code_challenge_method: {stored_method}"}, status_code=400)
+
+                # Verify S256 challenge
                 computed = base64.urlsafe_b64encode(
                     hashlib.sha256(code_verifier.encode()).digest()
                 ).rstrip(b"=").decode()
                 if computed != stored_challenge:
-                    print(f"[TOKEN] PKCE FAILED stored={stored_challenge} computed={computed}", flush=True)
+                    print("[TOKEN] PKCE verification failed", flush=True)
                     return JSONResponse({"error": "invalid_grant", "detail": "PKCE verification failed"}, status_code=400)
-            print(f"[TOKEN] SUCCESS - returning JWT", flush=True)
+
+            # Reject client_id mismatch
+            if stored_client_id and client_id and stored_client_id != client_id:
+                print(f"[TOKEN] client_id mismatch stored_prefix={stored_client_id[:20]} request_prefix={client_id[:20]}", flush=True)
+                return JSONResponse({"error": "invalid_grant", "detail": "client_id mismatch"}, status_code=400)
+
+            print("[TOKEN] Token issued successfully", flush=True)
             return JSONResponse({
                 "access_token": auth_info["jwt_token"],
                 "token_type": "bearer",
                 "expires_in": 86400,
             })
 
-        print(f"[TOKEN] Code not found in MongoDB, trying Google fallback", flush=True)
+        # --- Google OAuth fallback (direct Google code exchange) ---
+        print("[TOKEN] Code not found in _oauth_codes, falling back to Google OAuth", flush=True)
         client_secret = body.get("client_secret", "")
-
-        if client_id and client_id.startswith("https://"):
-            print(f"[TOKEN] CIMD client_id detected: {client_id[:60]}", flush=True)
-        elif client_id and client_id in _registered_clients:
-            expected_secret = _registered_clients[client_id].get("client_secret", "")
-            if client_secret and client_secret != expected_secret:
-                return JSONResponse({"error": "invalid_client"}, status_code=401)
-        elif client_id and db is not None:
-            registered = await db["_registered_clients"].find_one({"client_id": client_id})
-            if not registered and not client_id.startswith("https://"):
-                print(f"[TOKEN] Unknown client_id: {client_id[:40]}", flush=True)
 
         server_callback = str(request.base_url).rstrip("/") + "/auth/callback"
         token_data = await exchange_code_for_token(code, client_id=client_id or GOOGLE_CLIENT_ID, client_secret=client_secret or GOOGLE_CLIENT_SECRET, redirect_uri=server_callback)
@@ -536,6 +546,7 @@ async def _token(request: Request) -> JSONResponse:
         user_id, role, master_user_id = await _register_user(email, name)
         server_base = str(request.base_url).rstrip("/")
         jwt_token = create_jwt(user_id, email, name, role, master_user_id, issuer=server_base)
+        print("[TOKEN] Google OAuth token issued successfully", flush=True)
         return JSONResponse({
             "access_token": jwt_token,
             "token_type": "bearer",
